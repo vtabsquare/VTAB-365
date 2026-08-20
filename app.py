@@ -1,10 +1,10 @@
-"""Vtab Office Suite 365 V7 — pure Python 3.14 compatible workspace."""
+"""Vtab Office Suite 365 V7 — PostgreSQL (Supabase) edition."""
 
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from email import policy
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
@@ -13,15 +13,16 @@ import html
 import json
 import os
 from pathlib import Path
+import psycopg2
+import psycopg2.extras
+import psycopg2.errors
 import secrets
-import sqlite3
-import time
 from typing import Any
 import urllib.parse
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("VTAB_DB_PATH", str(BASE_DIR / "vtab_office_suite.db")))
+DATABASE_URL = os.environ.get("DATABASE_URL")
 HOST = os.environ.get("VTAB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", os.environ.get("VTAB_PORT", "8000")))
 SECRET_KEY = os.environ.get("VTAB_SECRET_KEY", "vtab-local-development-key-change-me").encode()
@@ -36,13 +37,59 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def db() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH, timeout=20)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    return con
+# ---------------------------------------------------------------------------
+# Database abstraction
+# Wraps psycopg2 so every call site (with db() as con: con.execute(...))
+# is identical to the original sqlite3 usage.
+# ---------------------------------------------------------------------------
 
+class _Cur:
+    """Chainable cursor wrapper — mirrors sqlite3 cursor interface."""
+    def __init__(self, cur: Any) -> None:
+        self._c = cur
+
+    def fetchone(self) -> dict | None:
+        return self._c.fetchone()
+
+    def fetchall(self) -> list[dict]:
+        return self._c.fetchall()
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class _Con:
+    """Connection wrapper — gives sqlite3-style .execute() on a psycopg2 conn."""
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    def execute(self, sql: str, params: tuple = ()) -> _Cur:
+        cur = self._conn.cursor()
+        cur.execute(sql, params)
+        return _Cur(cur)
+
+    def executemany(self, sql: str, seq) -> None:
+        cur = self._conn.cursor()
+        cur.executemany(sql, list(seq))
+
+
+@contextmanager
+def db():
+    """Open a PostgreSQL connection; commit on success, rollback on error."""
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        yield _Con(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Password helpers (unchanged — PBKDF2 logic is DB-independent)
+# ---------------------------------------------------------------------------
 
 def password_hash(password: str, salt: bytes | None = None) -> str:
     salt = salt or secrets.token_bytes(16)
@@ -60,22 +107,137 @@ def password_ok(password: str, stored: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Database initialisation (PostgreSQL schema — SERIAL, no AUTOINCREMENT/PRAGMA)
+# CREATE TABLE IF NOT EXISTS is a no-op when tables already exist in Supabase.
+# ---------------------------------------------------------------------------
+
 def init_database() -> None:
     with db() as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,email TEXT NOT NULL UNIQUE COLLATE NOCASE,password_hash TEXT NOT NULL,role TEXT NOT NULL,department TEXT NOT NULL,employee_id TEXT NOT NULL UNIQUE,registered_at TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1);
-        CREATE TABLE IF NOT EXISTS applications(id INTEGER PRIMARY KEY AUTOINCREMENT,slug TEXT NOT NULL UNIQUE,name TEXT NOT NULL,description TEXT NOT NULL,category TEXT NOT NULL,icon TEXT NOT NULL,color TEXT NOT NULL,url TEXT NOT NULL,sso_mode TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,built_in INTEGER NOT NULL DEFAULT 0,allowed_roles TEXT NOT NULL,version TEXT NOT NULL,publisher TEXT NOT NULL,created_at TEXT NOT NULL,visibility TEXT NOT NULL DEFAULT 'everyone',logo_url TEXT NOT NULL DEFAULT '');
-        CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,csrf_token TEXT NOT NULL,created_at TEXT NOT NULL,expires_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT NOT NULL,event_type TEXT NOT NULL,user_email TEXT NOT NULL,app_name TEXT,details TEXT NOT NULL,status TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS announcements(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,app_name TEXT NOT NULL,version TEXT NOT NULL,description TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,release_date TEXT NOT NULL DEFAULT '',highlights TEXT NOT NULL DEFAULT '',progress_percent INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,title TEXT NOT NULL,message TEXT NOT NULL,category TEXT NOT NULL,is_read INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS leave_requests(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL REFERENCES users(id),leave_type TEXT NOT NULL,start_date TEXT NOT NULL,end_date TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'Pending',created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS appraisals(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL REFERENCES users(id),quarter TEXT NOT NULL,feedback TEXT NOT NULL,created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS payroll_records(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL REFERENCES users(id),month TEXT NOT NULL,base_salary REAL NOT NULL,housing REAL NOT NULL,bonus REAL NOT NULL,tax REAL NOT NULL,insurance REAL NOT NULL,bank_account TEXT NOT NULL,payment_date TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS user_quick_access(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,app_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,position INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(user_id,app_id));
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS users(
+                id            SERIAL  PRIMARY KEY,
+                name          TEXT    NOT NULL,
+                email         TEXT    NOT NULL UNIQUE,
+                password_hash TEXT    NOT NULL,
+                role          TEXT    NOT NULL,
+                department    TEXT    NOT NULL,
+                employee_id   TEXT    NOT NULL UNIQUE,
+                registered_at TEXT    NOT NULL,
+                active        INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS applications(
+                id            SERIAL  PRIMARY KEY,
+                slug          TEXT    NOT NULL UNIQUE,
+                name          TEXT    NOT NULL,
+                description   TEXT    NOT NULL,
+                category      TEXT    NOT NULL,
+                icon          TEXT    NOT NULL,
+                color         TEXT    NOT NULL,
+                url           TEXT    NOT NULL,
+                sso_mode      TEXT    NOT NULL,
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                built_in      INTEGER NOT NULL DEFAULT 0,
+                allowed_roles TEXT    NOT NULL,
+                version       TEXT    NOT NULL,
+                publisher     TEXT    NOT NULL,
+                created_at    TEXT    NOT NULL,
+                visibility    TEXT    NOT NULL DEFAULT 'everyone',
+                logo_url      TEXT    NOT NULL DEFAULT ''
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS sessions(
+                id          TEXT    PRIMARY KEY,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                csrf_token  TEXT    NOT NULL,
+                created_at  TEXT    NOT NULL,
+                expires_at  TEXT    NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS audit_logs(
+                id          SERIAL PRIMARY KEY,
+                created_at  TEXT   NOT NULL,
+                event_type  TEXT   NOT NULL,
+                user_email  TEXT   NOT NULL,
+                app_name    TEXT,
+                details     TEXT   NOT NULL,
+                status      TEXT   NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS announcements(
+                id               SERIAL  PRIMARY KEY,
+                title            TEXT    NOT NULL,
+                app_name         TEXT    NOT NULL,
+                version          TEXT    NOT NULL,
+                description      TEXT    NOT NULL,
+                status           TEXT    NOT NULL,
+                created_at       TEXT    NOT NULL,
+                release_date     TEXT    NOT NULL DEFAULT '',
+                highlights       TEXT    NOT NULL DEFAULT '',
+                progress_percent INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS notifications(
+                id         SERIAL  PRIMARY KEY,
+                user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                title      TEXT    NOT NULL,
+                message    TEXT    NOT NULL,
+                category   TEXT    NOT NULL,
+                is_read    INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT    NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS leave_requests(
+                id         SERIAL  PRIMARY KEY,
+                user_id    INTEGER NOT NULL REFERENCES users(id),
+                leave_type TEXT    NOT NULL,
+                start_date TEXT    NOT NULL,
+                end_date   TEXT    NOT NULL,
+                reason     TEXT    NOT NULL,
+                status     TEXT    NOT NULL DEFAULT 'Pending',
+                created_at TEXT    NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS appraisals(
+                id         SERIAL  PRIMARY KEY,
+                user_id    INTEGER NOT NULL REFERENCES users(id),
+                quarter    TEXT    NOT NULL,
+                feedback   TEXT    NOT NULL,
+                created_at TEXT    NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS payroll_records(
+                id           SERIAL  PRIMARY KEY,
+                user_id      INTEGER NOT NULL REFERENCES users(id),
+                month        TEXT    NOT NULL,
+                base_salary  NUMERIC NOT NULL,
+                housing      NUMERIC NOT NULL,
+                bonus        NUMERIC NOT NULL,
+                tax          NUMERIC NOT NULL,
+                insurance    NUMERIC NOT NULL,
+                bank_account TEXT    NOT NULL,
+                payment_date TEXT    NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS user_quick_access(
+                user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                app_id   INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, app_id)
+            )
         """)
         if not con.execute("SELECT 1 FROM users LIMIT 1").fetchone():
-            con.executemany("INSERT INTO users(name,email,password_hash,role,department,employee_id,registered_at) VALUES(?,?,?,?,?,?,?)", [
+            con.executemany("INSERT INTO users(name,email,password_hash,role,department,employee_id,registered_at) VALUES(%s,%s,%s,%s,%s,%s,%s)", [
                 ("Elena Rostova", "admin@vtaboffice365.com", password_hash("Admin@123"), "Administrator", "IT & Security Operations", "ADM-001", "2024-11-10"),
                 ("Sarah Jenkins", "user@vtaboffice365.com", password_hash("User@123"), "Employee", "Operations", "EMP-204", "2025-01-15"),
             ])
@@ -90,17 +252,17 @@ def init_database() -> None:
                 ("meet-assistant","Meet Assistant","Meeting agendas, notes, action items and searchable summaries.","productivity","MA","#db2777","/app/meet-assistant","oidc",1,0,'["All Employees"]',"v1.0.0","Vtab Collaboration","everyone"),
                 ("workspace-control","Workspace Control Center","Administrator tools for application governance, access policies and workspace configuration.","operations","WC","#6d4bc3","/admin","oidc",1,1,'["Administrator"]',"v1.0.0","Vtab IT","admins"),
             ]
-            con.executemany("INSERT INTO applications(slug,name,description,category,icon,color,url,sso_mode,enabled,built_in,allowed_roles,version,publisher,created_at,visibility) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [a[:-1] + (now_iso(), a[-1]) for a in apps])
+            con.executemany("INSERT INTO applications(slug,name,description,category,icon,color,url,sso_mode,enabled,built_in,allowed_roles,version,publisher,created_at,visibility) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", [a[:-1] + (now_iso(), a[-1]) for a in apps])
         if not con.execute("SELECT 1 FROM announcements LIMIT 1").fetchone():
-            con.executemany("INSERT INTO announcements(title,app_name,version,description,status,created_at,release_date,highlights,progress_percent) VALUES(?,?,?,?,?,?,?,?,?)", [
+            con.executemany("INSERT INTO announcements(title,app_name,version,description,status,created_at,release_date,highlights,progress_percent) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)", [
                 ("Meeting Intelligence","Vtab Meet Intelligence","v1.0 Preview","Turn conversations into searchable decisions, summaries and assigned follow-up actions.","Planned",now_iso(),"Q1 2027","Decision tracking|Automatic action items|Searchable meeting memory",35),
                 ("Smarter workspace reservations","Asset & Desk Planner","v1.0","Reserve desks, meeting rooms and shared equipment from one visual workspace map.","Beta Testing",now_iso(),"Q4 2026","Interactive floor maps|Equipment reservations|Team neighbourhoods",62),
                 ("AI Copilot Workspace","Vtab AI Copilot","v1.0 Beta","Cross-application summaries, scheduling and document drafting.","Coming Soon",now_iso(),"Q4 2026","Cross-app summaries|Smart scheduling|Document drafting",75),
                 ("Unified Workspace is live","Vtab Office Suite 365","v1.0.0","One account now opens every registered workplace application.","Live Now",now_iso(),"Available now","Unified sign-in|Application launcher|Secure sessions",100),
             ])
         for user in con.execute("SELECT id FROM users").fetchall():
-            if not con.execute("SELECT 1 FROM payroll_records WHERE user_id=?", (user["id"],)).fetchone():
-                con.execute("INSERT INTO payroll_records(user_id,month,base_salary,housing,bonus,tax,insurance,bank_account,payment_date) VALUES(?,?,?,?,?,?,?,?,?)", (user["id"],"August 2026",5800,1200,750,820,180,"Vtab Bank •••• 4821","2026-08-28"))
+            if not con.execute("SELECT 1 FROM payroll_records WHERE user_id=%s", (user["id"],)).fetchone():
+                con.execute("INSERT INTO payroll_records(user_id,month,base_salary,housing,bonus,tax,insurance,bank_account,payment_date) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)", (user["id"],"August 2026",5800,1200,750,820,180,"Vtab Bank \u2022\u2022\u2022\u2022 4821","2026-08-28"))
 
 
 def nav_icon(name: str) -> str:
@@ -118,15 +280,15 @@ def nav_icon(name: str) -> str:
     return f'<svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{paths.get(name, paths["apps"])}</svg>'
 
 
-def product_icon(app: sqlite3.Row, small: bool = False) -> str:
+def product_icon(app: dict, small: bool = False) -> str:
     size = " product-icon-small" if small else ""
-    logo = app["logo_url"] if "logo_url" in app.keys() else ""
+    logo = app["logo_url"] if "logo_url" in app else ""
     if logo:
         return f'<span class="product-icon{size} custom-logo"><img src="{esc(logo)}" alt=""></span>'
     return f'<span class="product-icon{size}" style="--app-color:{esc(app["color"])}"><i></i><i></i><i></i><i></i><b>{esc(app["icon"])}</b></span>'
 
 
-def application_card(app: sqlite3.Row, admin: bool = False) -> str:
+def application_card(app: dict, admin: bool = False) -> str:
     label = "Admin only" if admin or app["visibility"] == "admins" else "Workspace"
     return f'<a class="card app-card" data-category="{esc(app["category"])}" data-search="{esc((app["name"]+" "+app["description"]).lower())}" href="/app/{esc(app["slug"])}" style="--app-tint:{esc(app["color"])}18"><div class="app-top">{product_icon(app)}<span class="visibility-pill {"admins" if label == "Admin only" else ""}">{label}</span></div><h3>{esc(app["name"])}</h3><p>{esc(app["description"])}</p><div class="meta"><span>{esc(app["category"].title())}</span><span>{esc(app["version"])}</span></div></a>'
 
@@ -172,17 +334,17 @@ class VtabHandler(BaseHTTPRequestHandler):
 
     def audit(self, event: str, email: str, details: str, app: str | None = None, status: str = "SUCCESS") -> None:
         with db() as con:
-            con.execute("INSERT INTO audit_logs(created_at,event_type,user_email,app_name,details,status) VALUES(?,?,?,?,?,?)", (now_iso(),event,email,app,details,status))
+            con.execute("INSERT INTO audit_logs(created_at,event_type,user_email,app_name,details,status) VALUES(%s,%s,%s,%s,%s,%s)", (now_iso(),event,email,app,details,status))
 
     def new_session(self, user_id: int) -> str:
         sid, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
         expiry = datetime.now(timezone.utc) + timedelta(hours=12)
         with db() as con:
-            con.execute("INSERT INTO sessions(id,user_id,csrf_token,created_at,expires_at) VALUES(?,?,?,?,?)", (sid,user_id,csrf,now_iso(),expiry.isoformat()))
+            con.execute("INSERT INTO sessions(id,user_id,csrf_token,created_at,expires_at) VALUES(%s,%s,%s,%s,%s)", (sid,user_id,csrf,now_iso(),expiry.isoformat()))
         signature = hmac.new(SECRET_KEY, sid.encode(), hashlib.sha256).hexdigest()
         return f"{COOKIE_NAME}={sid}.{signature}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200"
 
-    def current_session(self) -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+    def current_session(self) -> tuple[dict | None, dict | None]:
         jar = cookies.SimpleCookie()
         try:
             jar.load(self.headers.get("Cookie", ""))
@@ -192,13 +354,13 @@ class VtabHandler(BaseHTTPRequestHandler):
             if not hmac.compare_digest(supplied, expected):
                 return None, None
             with db() as con:
-                session = con.execute("SELECT * FROM sessions WHERE id=? AND expires_at>?", (sid,now_iso())).fetchone()
-                user = con.execute("SELECT * FROM users WHERE id=? AND active=1", (session["user_id"],)).fetchone() if session else None
+                session = con.execute("SELECT * FROM sessions WHERE id=%s AND expires_at>%s", (sid,now_iso())).fetchone()
+                user = con.execute("SELECT * FROM users WHERE id=%s AND active=1", (session["user_id"],)).fetchone() if session else None
             return user, session
         except (ValueError, KeyError):
             return None, None
 
-    def require_user(self) -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+    def require_user(self) -> tuple[dict | None, dict | None]:
         user, session = self.current_session()
         if not user:
             self.redirect("/login")
@@ -208,10 +370,10 @@ class VtabHandler(BaseHTTPRequestHandler):
         join = "&" if "?" in target else "?"
         self.redirect(f"{target}{join}{'error' if error else 'ok'}={urllib.parse.quote(message)}")
 
-    def check_csrf(self, form: dict[str, str], session: sqlite3.Row) -> bool:
+    def check_csrf(self, form: dict[str, str], session: dict) -> bool:
         return hmac.compare_digest(form.get("csrf", ""), session["csrf_token"])
 
-    def layout(self, title: str, content: str, user: sqlite3.Row | None = None, session: sqlite3.Row | None = None, active: str = "home", query: dict[str, list[str]] | None = None) -> str:
+    def layout(self, title: str, content: str, user: dict | None = None, session: dict | None = None, active: str = "home", query: dict[str, list[str]] | None = None) -> str:
         flashes = ""
         query = query or {}
         if query.get("ok"):
@@ -222,7 +384,7 @@ class VtabHandler(BaseHTTPRequestHandler):
         if not user:
             return head + content + '<script src="/assets/app.js"></script></body></html>'
         with db() as con:
-            pinned = con.execute("SELECT a.* FROM user_quick_access q JOIN applications a ON a.id=q.app_id WHERE q.user_id=? AND a.enabled=1 AND (a.visibility='everyone' OR ?='Administrator') ORDER BY q.position LIMIT 6", (user["id"],user["role"])).fetchall()
+            pinned = con.execute("SELECT a.* FROM user_quick_access q JOIN applications a ON a.id=q.app_id WHERE q.user_id=%s AND a.enabled=1 AND (a.visibility='everyone' OR %s='Administrator') ORDER BY q.position LIMIT 6", (user["id"],user["role"])).fetchall()
             if not pinned:
                 pinned = con.execute("SELECT * FROM applications WHERE enabled=1 AND visibility='everyone' ORDER BY built_in DESC,name LIMIT 3").fetchall()
         admin_nav = ""
@@ -238,11 +400,11 @@ class VtabHandler(BaseHTTPRequestHandler):
         content = f'<div class="login-page"><div class="login-card"><div class="brandmark">V</div><h1>Welcome to Vtab 365</h1><p>One secure account for every workplace application.</p>{error}<form method="post" action="/login" class="grid-form"><div class="field full"><label>Work email</label><input type="email" name="email" required></div><div class="field full"><label>Password</label><input type="password" name="password" required></div><div class="field full"><button class="btn">Sign in to workspace</button></div></form><div class="demo"><strong>Demo accounts</strong><br>Admin: admin@vtaboffice365.com / Admin@123<br>User: user@vtaboffice365.com / User@123</div><p style="text-align:center"><a href="/register">Create an employee account</a></p></div></div>'
         return self.layout("Sign in", content)
 
-    def dashboard(self, user: sqlite3.Row, session: sqlite3.Row, query: dict[str,list[str]]) -> str:
+    def dashboard(self, user: dict, session: dict, query: dict[str,list[str]]) -> str:
         with db() as con:
             apps = con.execute("SELECT * FROM applications WHERE enabled=1 AND visibility='everyone' ORDER BY built_in DESC,name").fetchall()
             releases = con.execute("SELECT * FROM announcements ORDER BY CASE WHEN status='Live Now' THEN 1 ELSE 0 END,id DESC LIMIT 6").fetchall()
-            pinned = con.execute("SELECT a.* FROM user_quick_access q JOIN applications a ON a.id=q.app_id WHERE q.user_id=? AND a.enabled=1 AND (a.visibility='everyone' OR ?='Administrator') ORDER BY q.position LIMIT 6", (user["id"],user["role"])).fetchall() or apps[:4]
+            pinned = con.execute("SELECT a.* FROM user_quick_access q JOIN applications a ON a.id=q.app_id WHERE q.user_id=%s AND a.enabled=1 AND (a.visibility='everyone' OR %s='Administrator') ORDER BY q.position LIMIT 6", (user["id"],user["role"])).fetchall() or apps[:4]
         categories = sorted({a["category"] for a in apps})
         chips = '<button class="chip active" data-cat="all">All</button>' + "".join(f'<button class="chip" data-cat="{esc(c)}">{esc(c.title())}</button>' for c in categories)
         quick = "".join(f'<a class="quick-access-tile" href="/app/{esc(a["slug"])}">{product_icon(a,True)}<span>{esc(a["name"])}</span></a>' for a in pinned)
@@ -270,12 +432,13 @@ class VtabHandler(BaseHTTPRequestHandler):
 
     def quick_page(self,user,session,query):
         with db() as con:
-            apps=con.execute("SELECT * FROM applications WHERE enabled=1 AND (visibility='everyone' OR ?='Administrator') ORDER BY visibility,built_in DESC,name",(user["role"],)).fetchall(); selected={r[0] for r in con.execute("SELECT app_id FROM user_quick_access WHERE user_id=?",(user["id"],))}
+            apps=con.execute("SELECT * FROM applications WHERE enabled=1 AND (visibility='everyone' OR %s='Administrator') ORDER BY visibility,built_in DESC,name",(user["role"],)).fetchall()
+            selected={r["app_id"] for r in con.execute("SELECT app_id FROM user_quick_access WHERE user_id=%s",(user["id"],)).fetchall()}
         choices="".join(f'<label class="quick-choice"><input type="checkbox" name="app_{a["id"]}" {"checked" if a["id"] in selected else ""}>{product_icon(a,True)}<span class="quick-choice-copy"><strong>{esc(a["name"])}</strong><small>{esc(a["category"].title())}{" · Admin only" if a["visibility"]=="admins" else ""}</small></span></label>' for a in apps)
         return self.layout("Customize Quick Access",f'<section class="page-intro"><div><div class="eyebrow">Personal workspace</div><h1>Customize Quick Access</h1><p>Choose up to six applications for Home and the sidebar.</p></div><a class="btn secondary page-home" href="/">{nav_icon("home")}Home</a></section><form class="panel" method="post" action="/quick-access/save"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><div class="quick-picker">{choices}</div><button class="btn">Save Quick Access</button></form>',user,session,"quick",query)
 
     def sso_page(self,user,session,query):
-        with db() as con: apps=con.execute("SELECT * FROM applications WHERE enabled=1 AND (visibility='everyone' OR ?='Administrator') ORDER BY name",(user["role"],)).fetchall()
+        with db() as con: apps=con.execute("SELECT * FROM applications WHERE enabled=1 AND (visibility='everyone' OR %s='Administrator') ORDER BY name",(user["role"],)).fetchall()
         rows="".join(f'<tr><td><div class="manage-app">{product_icon(a,True)}<strong>{esc(a["name"])}</strong></div></td><td>{esc(a["sso_mode"].upper())}</td><td><span class="status">Connected</span></td></tr>' for a in apps)
         return self.layout("Security & SSO",f'<section class="page-intro"><div><div class="eyebrow">Identity</div><h1>Security &amp; SSO</h1><p>Your Vtab identity securely connects permitted applications.</p></div><a class="btn secondary page-home" href="/">{nav_icon("home")}Home</a></section><div class="panel table-wrap"><table><thead><tr><th>Application</th><th>Protocol</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table></div>',user,session,"sso",query)
 
@@ -285,7 +448,9 @@ class VtabHandler(BaseHTTPRequestHandler):
 
     def admin_page(self,user,session,query):
         with db() as con:
-            apps=con.execute("SELECT * FROM applications ORDER BY built_in DESC,name").fetchall(); announcements=con.execute("SELECT * FROM announcements ORDER BY id DESC").fetchall(); logs=con.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 40").fetchall()
+            apps=con.execute("SELECT * FROM applications ORDER BY built_in DESC,name").fetchall()
+            announcements=con.execute("SELECT * FROM announcements ORDER BY id DESC").fetchall()
+            logs=con.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 40").fetchall()
         app_rows=""
         for a in apps:
             opts=f'<option value="everyone" {"selected" if a["visibility"]=="everyone" else ""}>Everyone</option><option value="admins" {"selected" if a["visibility"]=="admins" else ""}>Administrators only</option>'
@@ -295,22 +460,22 @@ class VtabHandler(BaseHTTPRequestHandler):
         log_rows="".join(f'<tr><td>{esc(l["created_at"][:19].replace("T"," "))}</td><td>{esc(l["event_type"])}</td><td>{esc(l["user_email"])}</td><td>{esc(l["app_name"] or "Workspace")}</td><td>{esc(l["status"])}</td></tr>' for l in logs)
         form=f'<section id="publish" class="tab-pane active panel"><h2>Add an application</h2><form class="grid-form" method="post" action="/admin/apps/create"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><div class="field"><label>Application name</label><input name="name" required></div><div class="field"><label>Unique slug</label><input name="slug" required pattern="[a-z0-9-]+"></div><div class="field full"><label>Description</label><textarea name="description" required></textarea></div><div class="field"><label>Category</label><select name="category"><option>productivity</option><option>hr</option><option>finance</option><option>operations</option><option>performance</option><option>custom</option></select></div><div class="field"><label>SSO protocol</label><select name="sso_mode"><option>oidc</option><option>saml2</option><option>jwt_header</option><option>shared_session</option><option>oauth2</option></select></div><div class="field"><label>Application URL</label><input name="url" required placeholder="https://app.company.com"></div><div class="field"><label>Version</label><input name="version" value="v1.0.0"></div><div class="field"><label>Publisher</label><input name="publisher" value="Vtab IT"></div><div class="field"><label>Brand color and hex code</label><div class="color-control"><input id="brand-color-picker" type="color" value="#5b5ce2"><input id="brand-color-code" name="color_code" value="#5B5CE2" pattern="#[0-9A-Fa-f]{{6}}" required></div><div class="color-preview"><span id="brand-color-swatch" class="color-preview-swatch"></span><span>Enter an exact 6-digit hex color.</span></div></div><div class="field"><label>Fallback icon initials</label><input name="icon" value="AP" maxlength="3"></div><div class="field full"><label>Custom logo URL or data image</label><div class="logo-uploader"><div class="logo-preview"><img id="app-logo-preview" hidden alt="Logo preview"><span>Logo preview</span></div><div><div class="logo-controls"><input id="app-logo-file" type="file" accept="image/*"><input id="app-logo-value" name="logo_url" placeholder="HTTPS image URL"></div><div class="field-help">Uploaded images must be smaller than 300 KB.</div></div></div></div><div class="field full"><label>Visibility</label><div class="visibility-picker"><label class="visibility-option"><input type="radio" name="visibility" value="everyone" checked><span><strong>Everyone</strong><small>General launcher</small></span></label><label class="visibility-option"><input type="radio" name="visibility" value="admins"><span><strong>Administrators only</strong><small>Protected admin launcher</small></span></label></div></div><button class="btn">Add application</button></form></section>'
         upcoming=f'<section id="upcoming" class="tab-pane panel"><h2>Publish upcoming application or update</h2><form class="grid-form" method="post" action="/admin/announcements/create"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><div class="field"><label>Headline</label><input name="title" required></div><div class="field"><label>Application name</label><input name="app_name" required></div><div class="field"><label>Version</label><input name="version" value="v1.0 Beta"></div><div class="field"><label>Status</label><select name="status"><option>Coming Soon</option><option>Beta Testing</option><option>Planned</option><option>Live Now</option></select></div><div class="field"><label>Expected release</label><input name="release_date" placeholder="Q4 2026"></div><div class="field"><label>Progress percentage</label><input type="number" min="0" max="100" name="progress_percent" value="0"></div><div class="field full"><label>Description</label><textarea name="description" required></textarea></div><div class="field full"><label>Highlights separated by |</label><input name="highlights"></div><button class="btn">Publish release information</button></form><div class="announcement-list">{ann_rows}</div></section>'
-        content=f'<section class="panel admin-hero"><div><div class="eyebrow">Administration</div><h1>Application settings</h1><p>Add applications, control visibility and publish releases.</p></div><a class="btn secondary page-home" href="/">{nav_icon("home")}Home</a></section><div data-tabs><div class="tabs"><button class="tab active" data-tab="publish">Add application</button><button class="tab" data-tab="manage">Manage & visibility</button><button class="tab" data-tab="upcoming">Upcoming releases</button><button class="tab" data-tab="audit">Audit trail</button></div>{form}<section id="manage" class="tab-pane panel"><h2>Manage applications</h2><div class="table-wrap"><table><thead><tr><th>Application</th><th>Category</th><th>Visibility</th><th>Status</th><th>Actions</th></tr></thead><tbody>{app_rows}</tbody></table></div></section>{upcoming}<section id="audit" class="tab-pane panel"><h2>Security audit trail</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>User</th><th>App</th><th>Status</th></tr></thead><tbody>{log_rows}</tbody></table></div></section></div>'
+        content=f'<section class="panel admin-hero"><div><div class="eyebrow">Administration</div><h1>Application settings</h1><p>Add applications, control visibility and publish releases.</p></div><a class="btn secondary page-home" href="/">{nav_icon("home")}Home</a></section><div data-tabs><div class="tabs"><button class="tab active" data-tab="publish">Add application</button><button class="tab" data-tab="manage">Manage &amp; visibility</button><button class="tab" data-tab="upcoming">Upcoming releases</button><button class="tab" data-tab="audit">Audit trail</button></div>{form}<section id="manage" class="tab-pane panel"><h2>Manage applications</h2><div class="table-wrap"><table><thead><tr><th>Application</th><th>Category</th><th>Visibility</th><th>Status</th><th>Actions</th></tr></thead><tbody>{app_rows}</tbody></table></div></section>{upcoming}<section id="audit" class="tab-pane panel"><h2>Security audit trail</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>User</th><th>App</th><th>Status</th></tr></thead><tbody>{log_rows}</tbody></table></div></section></div>'
         return self.layout("Application settings",content,user,session,"admin",query)
 
     def app_page(self,slug,user,session,query):
-        with db() as con: app=con.execute("SELECT * FROM applications WHERE slug=? AND enabled=1 AND (visibility='everyone' OR ?='Administrator')",(slug,user["role"])).fetchone()
+        with db() as con: app=con.execute("SELECT * FROM applications WHERE slug=%s AND enabled=1 AND (visibility='everyone' OR %s='Administrator')",(slug,user["role"])).fetchone()
         if not app: return self.layout("Not found",'<div class="panel"><h2>Application unavailable</h2></div>',user,session,"home",query)
         self.audit("APP_LAUNCH",user["email"],"Application opened.",app["name"])
         header=f'<section class="app-header"><div><div class="sso">Secure single sign-on · {esc(app["sso_mode"].upper())}</div><h1>{esc(app["name"])}</h1><p>{esc(app["description"])}</p></div>{product_icon(app)}</section>'
         if slug=="hr-portal":
-            with db() as con: requests=con.execute("SELECT * FROM leave_requests WHERE user_id=? ORDER BY id DESC",(user["id"],)).fetchall()
+            with db() as con: requests=con.execute("SELECT * FROM leave_requests WHERE user_id=%s ORDER BY id DESC",(user["id"],)).fetchall()
             body=f'<div class="metric-grid"><div class="panel metric"><small>Department</small><strong>{esc(user["department"])}</strong></div><div class="panel metric"><small>Employee ID</small><strong>{esc(user["employee_id"])}</strong></div><div class="panel metric"><small>Requests</small><strong>{len(requests)}</strong></div></div><div class="panel"><h2>Request leave</h2><form class="grid-form" method="post" action="/leave"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><div class="field"><label>Leave type</label><select name="leave_type"><option>Annual Leave</option><option>Sick Leave</option></select></div><div class="field"><label>Start date</label><input type="date" name="start_date" required></div><div class="field"><label>End date</label><input type="date" name="end_date" required></div><div class="field"><label>Reason</label><input name="reason"></div><button class="btn">Submit request</button></form></div>'
         elif slug=="appraisal":
             body=f'<div class="panel"><h2>Self-appraisal</h2><form class="grid-form" method="post" action="/appraisal"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><div class="field"><label>Quarter</label><select name="quarter"><option>Q3 2026</option><option>Q4 2026</option></select></div><div class="field full"><label>Achievements and feedback</label><textarea name="feedback" minlength="20" required></textarea></div><button class="btn">Submit appraisal</button></form></div>'
         elif slug=="payroll":
-            with db() as con: pay=con.execute("SELECT * FROM payroll_records WHERE user_id=? ORDER BY id DESC LIMIT 1",(user["id"],)).fetchone()
-            net=pay["base_salary"]+pay["housing"]+pay["bonus"]-pay["tax"]-pay["insurance"] if pay else 0
+            with db() as con: pay=con.execute("SELECT * FROM payroll_records WHERE user_id=%s ORDER BY id DESC LIMIT 1",(user["id"],)).fetchone()
+            net=float(pay["base_salary"])+float(pay["housing"])+float(pay["bonus"])-float(pay["tax"])-float(pay["insurance"]) if pay else 0
             body=f'<div class="metric-grid"><div class="panel metric"><small>Pay period</small><strong>{esc(pay["month"] if pay else "-")}</strong></div><div class="panel metric"><small>Net pay</small><strong>${net:,.2f}</strong></div><div class="panel metric"><small>Payment date</small><strong>{esc(pay["payment_date"] if pay else "-")}</strong></div></div><a class="btn" href="/payroll/download">Download payslip PDF</a>'
         elif slug=="meet-assistant":
             body='<div class="panel"><h2>Meet Assistant</h2><p>Capture agendas, decisions, searchable notes and assigned follow-up actions from one workspace.</p><div class="highlight-list"><span>Live notes</span><span>Action items</span><span>Searchable summaries</span></div></div>'
@@ -324,7 +489,7 @@ class VtabHandler(BaseHTTPRequestHandler):
         if path=="/assets/style.css": return self.send_bytes((BASE_DIR/"style.css").read_bytes(),content_type="text/css; charset=utf-8")
         if path=="/assets/app.js": return self.send_bytes((BASE_DIR/"app.js").read_bytes(),content_type="application/javascript; charset=utf-8")
         if path=="/favicon.ico": return self.send_bytes(b"",204,"image/x-icon")
-        if path=="/health": return self.text(json.dumps({"status":"ok","python":"source-runtime","database":str(DB_PATH)}),content_type="application/json")
+        if path=="/health": return self.text(json.dumps({"status":"ok","python":"source-runtime","database":"supabase-postgresql"}),content_type="application/json")
         if path=="/login":
             user,_=self.current_session(); return self.redirect("/") if user else self.text(self.login_page(query))
         if path=="/register":
@@ -340,7 +505,7 @@ class VtabHandler(BaseHTTPRequestHandler):
         if path=="/admin": return self.text(self.admin_page(user,session,query)) if user["role"]=="Administrator" else self.text(self.layout("Forbidden",'<div class="panel"><h2>Administrator access required</h2></div>',user,session),403)
         if path.startswith("/app/"): return self.text(self.app_page(urllib.parse.unquote(path[5:]),user,session,query))
         if path=="/api/apps":
-            with db() as con: rows=con.execute("SELECT id,slug,name,description,category,url,sso_mode,enabled,version,publisher,visibility FROM applications WHERE enabled=1 AND (visibility='everyone' OR ?='Administrator') ORDER BY name",(user["role"],)).fetchall()
+            with db() as con: rows=con.execute("SELECT id,slug,name,description,category,url,sso_mode,enabled,version,publisher,visibility FROM applications WHERE enabled=1 AND (visibility='everyone' OR %s='Administrator') ORDER BY name",(user["role"],)).fetchall()
             return self.text(json.dumps({"applications":[dict(r) for r in rows]},indent=2),content_type="application/json")
         if path=="/payroll/download": return self.download_payslip(user)
         return self.text(self.layout("Not found",'<div class="panel"><h2>Page not found</h2><a href="/">Return home</a></div>',user,session),404)
@@ -348,36 +513,39 @@ class VtabHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path,_=self.route(); form=self.form()
         if path=="/login":
-            with db() as con: user=con.execute("SELECT * FROM users WHERE email=? AND active=1",(form.get("email","").strip(),)).fetchone()
+            with db() as con: user=con.execute("SELECT * FROM users WHERE email=%s AND active=1",(form.get("email","").strip(),)).fetchone()
             if not user or not password_ok(form.get("password",""),user["password_hash"]): self.audit("LOGIN",form.get("email","anonymous"),"Invalid credentials.",status="FAILED"); return self.flash("/login","Invalid email or password.",True)
             self.audit("LOGIN",user["email"],"Workspace session created."); return self.redirect("/",self.new_session(user["id"]))
         if path=="/register":
             name,email,password=form.get("name","").strip(),form.get("email","").strip().lower(),form.get("password","")
             if not name or "@" not in email or len(password)<8: return self.flash("/register","Enter valid registration details.",True)
             try:
-                with db() as con: uid=con.execute("INSERT INTO users(name,email,password_hash,role,department,employee_id,registered_at) VALUES(?,?,?,'Employee',?,?,?)",(name,email,password_hash(password),form.get("department","General"),form.get("employee_id",""),datetime.now().date().isoformat())).lastrowid
-            except sqlite3.IntegrityError: return self.flash("/register","Email or employee ID already exists.",True)
+                with db() as con:
+                    uid=con.execute("INSERT INTO users(name,email,password_hash,role,department,employee_id,registered_at) VALUES(%s,%s,%s,'Employee',%s,%s,%s) RETURNING id",(name,email,password_hash(password),form.get("department","General"),form.get("employee_id",""),datetime.now().date().isoformat())).fetchone()["id"]
+            except psycopg2.errors.UniqueViolation: return self.flash("/register","Email or employee ID already exists.",True)
             return self.redirect("/",self.new_session(uid))
         user,session=self.require_user()
         if not user: return
         if not self.check_csrf(form,session): return self.text(self.layout("Invalid request",'<div class="panel"><h2>Security check failed</h2></div>',user,session),403)
         if path=="/logout":
-            with db() as con: con.execute("DELETE FROM sessions WHERE id=?",(session["id"],))
+            with db() as con: con.execute("DELETE FROM sessions WHERE id=%s",(session["id"],))
             return self.redirect("/login",f"{COOKIE_NAME}=; Path=/; Max-Age=0")
         if path=="/quick-access/save":
             ids=[int(k[4:]) for k in form if k.startswith("app_") and k[4:].isdigit()][:6]
             with db() as con:
-                allowed={r[0] for r in con.execute("SELECT id FROM applications WHERE enabled=1 AND (visibility='everyone' OR ?='Administrator')",(user["role"],))}; con.execute("DELETE FROM user_quick_access WHERE user_id=?",(user["id"],)); con.executemany("INSERT INTO user_quick_access(user_id,app_id,position) VALUES(?,?,?)",[(user["id"],i,p) for p,i in enumerate(ids) if i in allowed])
+                allowed={r["id"] for r in con.execute("SELECT id FROM applications WHERE enabled=1 AND (visibility='everyone' OR %s='Administrator')",(user["role"],)).fetchall()}
+                con.execute("DELETE FROM user_quick_access WHERE user_id=%s",(user["id"],))
+                con.executemany("INSERT INTO user_quick_access(user_id,app_id,position) VALUES(%s,%s,%s)",[(user["id"],i,p) for p,i in enumerate(ids) if i in allowed])
             return self.flash("/quick-access","Quick Access updated.")
         if path=="/leave":
             start,end=form.get("start_date",""),form.get("end_date","")
             if not start or not end or end<start: return self.flash("/app/hr-portal","End date must be after the start date.",True)
-            with db() as con: con.execute("INSERT INTO leave_requests(user_id,leave_type,start_date,end_date,reason,status,created_at) VALUES(?,?,?,?,?,'Pending',?)",(user["id"],form.get("leave_type","Annual Leave"),start,end,form.get("reason","")[:250],now_iso()))
+            with db() as con: con.execute("INSERT INTO leave_requests(user_id,leave_type,start_date,end_date,reason,status,created_at) VALUES(%s,%s,%s,%s,%s,'Pending',%s)",(user["id"],form.get("leave_type","Annual Leave"),start,end,form.get("reason","")[:250],now_iso()))
             return self.flash("/app/hr-portal","Leave request submitted.")
         if path=="/appraisal":
             feedback=form.get("feedback","").strip()
             if len(feedback)<20: return self.flash("/app/appraisal","Please provide at least 20 characters.",True)
-            with db() as con: con.execute("INSERT INTO appraisals(user_id,quarter,feedback,created_at) VALUES(?,?,?,?)",(user["id"],form.get("quarter","Q3 2026"),feedback[:5000],now_iso()))
+            with db() as con: con.execute("INSERT INTO appraisals(user_id,quarter,feedback,created_at) VALUES(%s,%s,%s,%s)",(user["id"],form.get("quarter","Q3 2026"),feedback[:5000],now_iso()))
             return self.flash("/app/appraisal","Self-appraisal submitted.")
         if not path.startswith("/admin/") or user["role"]!="Administrator": return self.text("Forbidden",403)
         if path=="/admin/apps/create":
@@ -387,34 +555,34 @@ class VtabHandler(BaseHTTPRequestHandler):
             if visibility not in {"everyone","admins"}: visibility="everyone"
             if logo and not logo.startswith(("https://","data:image/")): return self.flash("/admin","Logo must be HTTPS or an uploaded image.",True)
             try:
-                with db() as con: con.execute("INSERT INTO applications(slug,name,description,category,icon,color,url,sso_mode,enabled,built_in,allowed_roles,version,publisher,created_at,visibility,logo_url) VALUES(?,?,?,?,?,?,?,?,1,0,?,?,?,?,?,?)",(slug,form.get("name","")[:80],form.get("description","")[:400],form.get("category","custom"),form.get("icon","AP")[:3].upper(),color.upper(),form.get("url","")[:500],form.get("sso_mode","oidc"),'["All Employees"]',form.get("version","v1.0.0")[:30],form.get("publisher","Vtab IT")[:100],now_iso(),visibility,logo))
-            except sqlite3.IntegrityError: return self.flash("/admin","Application slug already exists.",True)
+                with db() as con: con.execute("INSERT INTO applications(slug,name,description,category,icon,color,url,sso_mode,enabled,built_in,allowed_roles,version,publisher,created_at,visibility,logo_url) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,1,0,%s,%s,%s,%s,%s,%s)",(slug,form.get("name","")[:80],form.get("description","")[:400],form.get("category","custom"),form.get("icon","AP")[:3].upper(),color.upper(),form.get("url","")[:500],form.get("sso_mode","oidc"),'["All Employees"]',form.get("version","v1.0.0")[:30],form.get("publisher","Vtab IT")[:100],now_iso(),visibility,logo))
+            except psycopg2.errors.UniqueViolation: return self.flash("/admin","Application slug already exists.",True)
             return self.flash("/admin","Application added.")
         if path=="/admin/apps/settings":
             visibility=form.get("visibility","everyone"); visibility=visibility if visibility in {"everyone","admins"} else "everyone"
-            with db() as con: con.execute("UPDATE applications SET visibility=? WHERE id=?",(visibility,form.get("id")))
+            with db() as con: con.execute("UPDATE applications SET visibility=%s WHERE id=%s",(visibility,form.get("id")))
             return self.flash("/admin?tab=manage","Visibility updated.")
         if path=="/admin/apps/toggle":
-            with db() as con: con.execute("UPDATE applications SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?",(form.get("id"),))
+            with db() as con: con.execute("UPDATE applications SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=%s",(form.get("id"),))
             return self.flash("/admin?tab=manage","Application status updated.")
         if path=="/admin/apps/delete":
-            with db() as con: con.execute("DELETE FROM applications WHERE id=? AND built_in=0",(form.get("id"),))
+            with db() as con: con.execute("DELETE FROM applications WHERE id=%s AND built_in=0",(form.get("id"),))
             return self.flash("/admin?tab=manage","Application removed.")
         if path=="/admin/announcements/create":
             try: progress=max(0,min(100,int(form.get("progress_percent","0") or 0)))
             except ValueError: progress=0
-            with db() as con: con.execute("INSERT INTO announcements(title,app_name,version,description,status,created_at,release_date,highlights,progress_percent) VALUES(?,?,?,?,?,?,?,?,?)",(form.get("title","")[:120],form.get("app_name","")[:100],form.get("version","v1.0")[:40],form.get("description","")[:600],form.get("status","Coming Soon"),now_iso(),form.get("release_date","")[:80],form.get("highlights","")[:500],progress))
+            with db() as con: con.execute("INSERT INTO announcements(title,app_name,version,description,status,created_at,release_date,highlights,progress_percent) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",(form.get("title","")[:120],form.get("app_name","")[:100],form.get("version","v1.0")[:40],form.get("description","")[:600],form.get("status","Coming Soon"),now_iso(),form.get("release_date","")[:80],form.get("highlights","")[:500],progress))
             return self.flash("/admin?tab=upcoming","Release information published.")
         if path=="/admin/announcements/delete":
-            with db() as con: con.execute("DELETE FROM announcements WHERE id=?",(form.get("id"),))
+            with db() as con: con.execute("DELETE FROM announcements WHERE id=%s",(form.get("id"),))
             return self.flash("/admin?tab=upcoming","Release information removed.")
         return self.text("Not found",404)
 
     def download_payslip(self,user):
-        with db() as con: pay=con.execute("SELECT * FROM payroll_records WHERE user_id=? ORDER BY id DESC LIMIT 1",(user["id"],)).fetchone()
+        with db() as con: pay=con.execute("SELECT * FROM payroll_records WHERE user_id=%s ORDER BY id DESC LIMIT 1",(user["id"],)).fetchone()
         if not pay: return self.text("No payroll record",404)
-        net=pay["base_salary"]+pay["housing"]+pay["bonus"]-pay["tax"]-pay["insurance"]
-        lines=["VTAB OFFICE SUITE 365 - PAYSLIP",f"Employee: {user['name']} ({user['employee_id']})",f"Period: {pay['month']}","",f"Basic salary: ${pay['base_salary']:,.2f}",f"Housing: ${pay['housing']:,.2f}",f"Bonus: ${pay['bonus']:,.2f}",f"Tax: -${pay['tax']:,.2f}",f"Insurance: -${pay['insurance']:,.2f}",f"NET PAY: ${net:,.2f}"]
+        net=float(pay["base_salary"])+float(pay["housing"])+float(pay["bonus"])-float(pay["tax"])-float(pay["insurance"])
+        lines=["VTAB OFFICE SUITE 365 - PAYSLIP",f"Employee: {user['name']} ({user['employee_id']})",f"Period: {pay['month']}","",f"Basic salary: ${float(pay['base_salary']):,.2f}",f"Housing: ${float(pay['housing']):,.2f}",f"Bonus: ${float(pay['bonus']):,.2f}",f"Tax: -${float(pay['tax']):,.2f}",f"Insurance: -${float(pay['insurance']):,.2f}",f"NET PAY: ${net:,.2f}"]
         def pe(s): return s.replace("\\","\\\\").replace("(","\\(").replace(")","\\)")
         commands=["BT","/F1 17 Tf","55 780 Td",f"({pe(lines[0])}) Tj","/F1 11 Tf"]
         for line in lines[1:]: commands += ["0 -25 Td",f"({pe(line)}) Tj"]
@@ -429,10 +597,15 @@ class VtabHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is not set. "
+                           "Get the connection string from Supabase Dashboard → "
+                           "Project Settings → Database → Connection string (URI).")
     init_database()
-    print("Vtab Office Suite 365 V7 — Python 3.14 compatible")
-    print(f"Database: {DB_PATH}")
+    print("Vtab Office Suite 365 V7 — PostgreSQL (Supabase) edition")
+    print(f"Database: Supabase PostgreSQL")
     print(f"Open http://{HOST}:{PORT} in your browser")
-    if SECRET_KEY == b"vtab-local-development-key-change-me": print("Development mode: set VTAB_SECRET_KEY before production use.")
+    if SECRET_KEY == b"vtab-local-development-key-change-me":
+        print("Development mode: set VTAB_SECRET_KEY before production use.")
     try: ThreadingHTTPServer((HOST,PORT),VtabHandler).serve_forever()
     except KeyboardInterrupt: print("\nServer stopped.")

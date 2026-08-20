@@ -1,2 +1,1 @@
-# Render requires a requirements.txt file to detect a Python environment.
-# This application is pure standard-library Python, so no external dependencies are required.
+psycopg2-binary==2.9.9
