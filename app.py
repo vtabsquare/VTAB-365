@@ -480,7 +480,8 @@ class VtabHandler(BaseHTTPRequestHandler):
         elif slug=="meet-assistant":
             body='<div class="panel"><h2>Meet Assistant</h2><p>Capture agendas, decisions, searchable notes and assigned follow-up actions from one workspace.</p><div class="highlight-list"><span>Live notes</span><span>Action items</span><span>Searchable summaries</span></div></div>'
         elif app["url"].startswith("http"):
-            body=f'<div class="panel"><h2>Ready to launch</h2><p>Vtab will open this registered application using your workspace identity.</p><a class="btn" href="{esc(app["url"])}" target="_blank" rel="noopener">Open application</a></div>'
+            launch_url = f"/api/sso/token?app={esc(app['slug'])}" if app["sso_mode"] == "vtab_assertion" else esc(app["url"])
+            body=f'<div class="panel"><h2>Ready to launch</h2><p>Vtab will open this registered application using your workspace identity.</p><a class="btn" href="{launch_url}" target="_blank" rel="noopener">Open application</a></div>'
         else: body='<div class="panel"><h2>Workspace application</h2><p>This application is connected to your Vtab identity.</p></div>'
         return self.layout(app["name"],header+body,user,session,"home",query)
 
@@ -508,6 +509,40 @@ class VtabHandler(BaseHTTPRequestHandler):
             with db() as con: rows=con.execute("SELECT id,slug,name,description,category,url,sso_mode,enabled,version,publisher,visibility FROM applications WHERE enabled=1 AND (visibility='everyone' OR %s='Administrator') ORDER BY name",(user["role"],)).fetchall()
             return self.text(json.dumps({"applications":[dict(r) for r in rows]},indent=2),content_type="application/json")
         if path=="/payroll/download": return self.download_payslip(user)
+        if path=="/api/sso/token":
+            app_slug = query.get("app", [""])[0]
+            if not app_slug: return self.text(self.layout("SSO Error", "<div class='panel'><h2>Missing application identifier</h2></div>", user, session), 400)
+            with db() as con:
+                app_record = con.execute("SELECT * FROM applications WHERE slug=%s AND enabled=1", (app_slug,)).fetchone()
+            if not app_record: return self.text(self.layout("SSO Error", "<div class='panel'><h2>Application not found or disabled</h2></div>", user, session), 404)
+            sso_secret = os.getenv("VTAB_SSO_SECRET")
+            if not sso_secret: return self.text(self.layout("SSO Error", "<div class='panel'><h2>SSO not configured (missing secret)</h2></div>", user, session), 500)
+            
+            import uuid
+            payload = {
+                "iss": "vtab360",
+                "aud": app_slug,
+                "purpose": "vtab_sso",
+                "employee_id": user["employee_id"],
+                "email": user["email"],
+                "name": user["name"],
+                "iat": int(datetime.now(timezone.utc).timestamp()),
+                "exp": int((datetime.now(timezone.utc) + timedelta(minutes=2)).timestamp()),
+                "jti": str(uuid.uuid4())
+            }
+            def b64url(b): return base64.urlsafe_b64encode(b).replace(b'=', b'').decode('ascii')
+            header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+            payload_str = b64url(json.dumps(payload).encode())
+            signature = b64url(hmac.new(sso_secret.encode(), f"{header}.{payload_str}".encode(), hashlib.sha256).digest())
+            assertion = f"{header}.{payload_str}.{signature}"
+            
+            self.audit("SSO_LOGIN", user["email"], f"Generated SSO assertion for {app_slug}.", app=app_slug)
+            
+            target_url = app_record["url"]
+            sep = "&" if "?" in target_url else "?"
+            redirect_url = f"{target_url}{sep}token={urllib.parse.quote(assertion)}"
+            return self.redirect(redirect_url)
+            
         return self.text(self.layout("Not found",'<div class="panel"><h2>Page not found</h2><a href="/">Return home</a></div>',user,session),404)
 
     def do_POST(self):
