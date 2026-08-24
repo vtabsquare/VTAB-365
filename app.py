@@ -468,7 +468,10 @@ class VtabHandler(BaseHTTPRequestHandler):
         if not app: return self.layout("Not found",'<div class="panel"><h2>Application unavailable</h2></div>',user,session,"home",query)
         self.audit("APP_LAUNCH",user["email"],"Application opened.",app["name"])
         header=f'<section class="app-header"><div><div class="sso">Secure single sign-on · {esc(app["sso_mode"].upper())}</div><h1>{esc(app["name"])}</h1><p>{esc(app["description"])}</p></div>{product_icon(app)}</section>'
-        if slug=="hr-portal":
+        if app["url"] and app["url"].startswith("http"):
+            launch_url = f"/api/sso/token?app={esc(app['slug'])}" if app["sso_mode"] == "vtab_assertion" else esc(app["url"])
+            body=f'<div class="panel"><h2>Ready to launch</h2><p>Vtab will open this registered application using your workspace identity.</p><a class="btn" href="{launch_url}" target="_blank" rel="noopener">Open application</a></div>'
+        elif slug=="hr-portal":
             with db() as con: requests=con.execute("SELECT * FROM leave_requests WHERE user_id=%s ORDER BY id DESC",(user["id"],)).fetchall()
             body=f'<div class="metric-grid"><div class="panel metric"><small>Department</small><strong>{esc(user["department"])}</strong></div><div class="panel metric"><small>Employee ID</small><strong>{esc(user["employee_id"])}</strong></div><div class="panel metric"><small>Requests</small><strong>{len(requests)}</strong></div></div><div class="panel"><h2>Request leave</h2><form class="grid-form" method="post" action="/leave"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><div class="field"><label>Leave type</label><select name="leave_type"><option>Annual Leave</option><option>Sick Leave</option></select></div><div class="field"><label>Start date</label><input type="date" name="start_date" required></div><div class="field"><label>End date</label><input type="date" name="end_date" required></div><div class="field"><label>Reason</label><input name="reason"></div><button class="btn">Submit request</button></form></div>'
         elif slug=="appraisal":
@@ -479,9 +482,6 @@ class VtabHandler(BaseHTTPRequestHandler):
             body=f'<div class="metric-grid"><div class="panel metric"><small>Pay period</small><strong>{esc(pay["month"] if pay else "-")}</strong></div><div class="panel metric"><small>Net pay</small><strong>${net:,.2f}</strong></div><div class="panel metric"><small>Payment date</small><strong>{esc(pay["payment_date"] if pay else "-")}</strong></div></div><a class="btn" href="/payroll/download">Download payslip PDF</a>'
         elif slug=="meet-assistant":
             body='<div class="panel"><h2>Meet Assistant</h2><p>Capture agendas, decisions, searchable notes and assigned follow-up actions from one workspace.</p><div class="highlight-list"><span>Live notes</span><span>Action items</span><span>Searchable summaries</span></div></div>'
-        elif app["url"].startswith("http"):
-            launch_url = f"/api/sso/token?app={esc(app['slug'])}" if app["sso_mode"] == "vtab_assertion" else esc(app["url"])
-            body=f'<div class="panel"><h2>Ready to launch</h2><p>Vtab will open this registered application using your workspace identity.</p><a class="btn" href="{launch_url}" target="_blank" rel="noopener">Open application</a></div>'
         else: body='<div class="panel"><h2>Workspace application</h2><p>This application is connected to your Vtab identity.</p></div>'
         return self.layout(app["name"],header+body,user,session,"home",query)
 
@@ -636,7 +636,16 @@ if __name__ == "__main__":
         raise RuntimeError("DATABASE_URL environment variable is not set. "
                            "Get the connection string from Supabase Dashboard → "
                            "Project Settings → Database → Connection string (URI).")
-    init_database()
+    import time as _time
+    for _attempt in range(30):
+        try:
+            init_database()
+            break
+        except Exception as _e:
+            if _attempt == 29:
+                raise
+            print(f"[VTAB] DB not ready yet ({_e}). Retrying in 10 seconds... (attempt {_attempt+1}/30)")
+            _time.sleep(10)
     print("Vtab Office Suite 365 V7 — PostgreSQL (Supabase) edition")
     print(f"Database: Supabase PostgreSQL")
     print(f"Open http://{HOST}:{PORT} in your browser")
@@ -644,3 +653,4 @@ if __name__ == "__main__":
         print("Development mode: set VTAB_SECRET_KEY before production use.")
     try: ThreadingHTTPServer((HOST,PORT),VtabHandler).serve_forever()
     except KeyboardInterrupt: print("\nServer stopped.")
+
