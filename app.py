@@ -270,12 +270,54 @@ def nav_icon(name: str) -> str:
     return f'<svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{paths.get(name, paths["apps"])}</svg>'
 
 
+# Inline SVG icon library — no CDN required, always renders
+_SVG_ICONS = {
+    "fa-chart-line":        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
+    "fa-sliders":           '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>',
+    "fa-file-invoice-dollar": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="13" x2="15" y2="13"/></svg>',
+    "fa-users":             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+    "fa-window-maximize":   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="18" rx="2"/><line x1="2" y1="8" x2="22" y2="8"/></svg>',
+    "fa-user-shield":       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg>',
+    "fa-file-signature":    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 19.5v.5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8.5L18 5.5"/><path d="M8 18h1l12.5-12.5-1-1L8 17v1z"/></svg>',
+    "fa-database":          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
+    "fa-bolt":              '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+    "fa-exchange-alt":      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>',
+    "fa-vial":              '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2v17.5c0 1.4-1.1 2.5-2.5 2.5h0c-1.4 0-2.5-1.1-2.5-2.5V2"/><path d="M8.5 2h7"/><path d="M14.5 16h-5"/></svg>',
+    "fa-building":          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="2" width="16" height="20" rx="1"/><path d="M9 22v-4h6v4"/><path d="M8 6h.01M16 6h.01M12 6h.01M8 10h.01M16 10h.01M12 10h.01M8 14h.01M16 14h.01M12 14h.01"/></svg>',
+}
+
+def _get_svg(icon_val: str) -> str | None:
+    """Extract the last fa-xxx keyword from an icon class string and look it up."""
+    import re as _re
+    keys = _re.findall(r'fa-[\w-]+', icon_val)
+    for key in reversed(keys):
+        if key in _SVG_ICONS:
+            return _SVG_ICONS[key]
+    return None
+
 def product_icon(app: dict, small: bool = False) -> str:
     size = " product-icon-small" if small else ""
-    logo = app["logo_url"] if "logo_url" in app else ""
+    logo = app.get("logo_url")
     if logo:
         return f'<span class="product-icon{size} custom-logo"><img src="{esc(logo)}" alt=""></span>'
-    return f'<span class="product-icon{size}" style="--app-color:{esc(app["color"])}"><i></i><i></i><i></i><i></i><b>{esc(app["icon"])}</b></span>'
+
+    icon_val = str(app.get("icon", "")).strip()
+    svg = _get_svg(icon_val)
+    if svg:
+        content = svg
+    else:
+        import re
+        clean_name = re.sub(r'[^a-zA-Z0-9\s]', '', app.get("name", ""))
+        words = [w for w in clean_name.split() if w.strip()]
+        if not words:
+            initials = "VT"
+        elif len(words) == 1:
+            initials = words[0][:2].upper()
+        else:
+            initials = (words[0][0] + words[1][0]).upper()
+        content = f'<b>{esc(initials)}</b>'
+
+    return f'<span class="product-icon{size}" style="--app-color:{esc(app["color"])}">{content}</span>'
 
 
 def application_card(app: dict, admin: bool = False) -> str:
@@ -401,7 +443,7 @@ class VtabHandler(BaseHTTPRequestHandler):
             flashes += f'<div class="flash">{esc(query["ok"][0])}</div>'
         if query.get("error"):
             flashes += f'<div class="flash error">{esc(query["error"][0])}</div>'
-        head = f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Vtab 365</title><link rel="stylesheet" href="/assets/style.css"></head><body>'
+        head = f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} &middot; Vtab 365</title><link rel="icon" type="image/png" href="/favicon.ico"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css"><link rel="stylesheet" href="/assets/style.css?v=5"></head><body>'
         if not user:
             return head + content + '<script src="/assets/app.js"></script></body></html>'
         with db() as con:
@@ -414,16 +456,16 @@ class VtabHandler(BaseHTTPRequestHandler):
         side_apps = "".join(f'<a href="/app/{esc(a["slug"])}">{product_icon(a,True)}<span>{esc(a["name"])}</span></a>' for a in pinned)
         initials = "".join(part[0] for part in user["name"].split()[:2]).upper()
         add = f'<a class="btn" href="/admin">{nav_icon("plus")}Add app</a>' if user["role"] == "Administrator" else ""
-        return head + f'<div class="shell"><aside class="sidebar"><div class="brand"><div class="brandmark">V</div><div><strong>Vtab 365</strong><small>Office workspace</small></div></div><nav class="nav"><div class="nav-label">Workspace</div><a class="{"active" if active=="home" else ""}" href="/">{nav_icon("home")}<span>Home</span></a><a class="{"active" if active=="apps" else ""}" href="/apps">{nav_icon("apps")}<span>All applications</span></a><a class="{"active" if active=="updates" else ""}" href="/updates">{nav_icon("news")}<span>What\'s new</span></a><a class="{"active" if active=="sso" else ""}" href="/sso">{nav_icon("shield")}<span>Security &amp; SSO</span></a>{admin_nav}<div class="sidebar-section-head"><div class="nav-label">Quick access</div><a class="quick-settings" href="/quick-access">Customize</a></div><div class="sidebar-apps">{side_apps}</div></nav><div class="side-user"><div class="avatar">{esc(initials)}</div><div class="user-copy"><strong>{esc(user["name"])}</strong><small>{esc(user["role"])}</small><small>{esc(user["email"])}</small></div></div></aside><section class="main"><header class="topbar"><div class="top-search">{nav_icon("search")}<input id="app-search" class="search" placeholder="Search applications"></div><div class="actions">{add}<div class="top-avatar">{esc(initials[:1])}</div><form method="post" action="/logout"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><button class="btn secondary icon-btn" title="Sign out" aria-label="Sign out">{nav_icon("logout")}</button></form></div></header><main class="content">{flashes}{content}</main></section></div><script src="/assets/app.js"></script></body></html>'
+        return head + f'<div class="shell"><aside class="sidebar"><div class="brand"><img class="brandmark" src="/logo.png" alt="VTAB 365"><div><strong>Vtab 365</strong><small>Office workspace</small></div></div><nav class="nav"><div class="nav-label">Workspace</div><a class="{"active" if active=="home" else ""}" href="/">{nav_icon("home")}<span>Home</span></a><a class="{"active" if active=="apps" else ""}" href="/apps">{nav_icon("apps")}<span>All applications</span></a><a class="{"active" if active=="updates" else ""}" href="/updates">{nav_icon("news")}<span>What\'s new</span></a><a class="{"active" if active=="sso" else ""}" href="/sso">{nav_icon("shield")}<span>Security &amp; SSO</span></a>{admin_nav}<div class="sidebar-section-head"><div class="nav-label">Quick access</div><a class="quick-settings" href="/quick-access">Customize</a></div><div class="sidebar-apps">{side_apps}</div></nav><div class="side-user"><div class="avatar">{esc(initials)}</div><div class="user-copy"><strong>{esc(user["name"])}</strong><small>{esc(user["role"])}</small><small>{esc(user["email"])}</small></div></div></aside><section class="main"><header class="topbar"><div class="top-search">{nav_icon("search")}<input id="app-search" class="search" placeholder="Search applications"></div><div class="actions">{add}<div class="top-avatar">{esc(initials[:1])}</div><form method="post" action="/logout"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><button class="btn secondary icon-btn" title="Sign out" aria-label="Sign out">{nav_icon("logout")}</button></form></div></header><main class="content">{flashes}{content}</main></section></div><script src="/assets/app.js"></script></body></html>'
 
     def login_page(self, query: dict[str, list[str]]) -> str:
         error = f'<div class="flash error">{esc(query["error"][0])}</div>' if query.get("error") else ""
-        content = f'<div class="login-page"><div class="login-card"><div class="brandmark">V</div><h1>Welcome to Vtab 365</h1><p>One secure account for every workplace application.</p>{error}<form method="post" action="/login" class="grid-form"><div class="field full"><label>Work email</label><input type="email" name="email" required></div><div class="field full"><label>Password</label><input type="password" name="password" required></div><div class="field full"><button class="btn">Sign in to workspace</button></div></form><p style="text-align:center"><a href="/register">Create an employee account</a></p></div></div>'
+        content = f'<div class="login-page"><div class="login-card"><img class="brandmark" src="/logo.png" alt="VTAB 365"><h1>Welcome to Vtab 365</h1><p>One secure account for every workplace application.</p>{error}<form method="post" action="/login" class="grid-form"><div class="field full"><label>Work email</label><input type="email" name="email" required></div><div class="field full"><label>Password</label><input type="password" name="password" required></div><div class="field full"><button class="btn">Sign in to workspace</button></div></form><p style="text-align:center"><a href="/register">Create an employee account</a></p></div></div>'
         return self.layout("Sign in", content)
 
     def verify_otp_page(self, query: dict[str, list[str]]) -> str:
         error = f'<div class="flash error">{esc(query["error"][0])}</div>' if query.get("error") else ""
-        content = f'<div class="login-page"><div class="login-card"><div class="brandmark">V</div><h1>Two-Factor Authentication</h1><p>We sent a 6-digit code to your email. Please enter it below to continue.</p>{error}<form method="post" action="/verify-otp" class="grid-form"><div class="field full"><label>Verification Code</label><input type="text" name="otp_code" placeholder="123456" required autocomplete="off"></div><div class="field full"><button class="btn">Verify and Sign in</button></div></form><p style="text-align:center"><a href="/login">Back to sign in</a></p></div></div>'
+        content = f'<div class="login-page"><div class="login-card"><img class="brandmark" src="/logo.png" alt="VTAB 365"><h1>Two-Factor Authentication</h1><p>We sent a 6-digit code to your email. Please enter it below to continue.</p>{error}<form method="post" action="/verify-otp" class="grid-form"><div class="field full"><label>Verification Code</label><input type="text" name="otp_code" placeholder="123456" required autocomplete="off"></div><div class="field full"><button class="btn">Verify and Sign in</button></div></form><p style="text-align:center"><a href="/login">Back to sign in</a></p></div></div>'
         return self.layout("Verify OTP", content)
 
     def dashboard(self, user: dict, session: dict, query: dict[str,list[str]]) -> str:
@@ -521,14 +563,15 @@ class VtabHandler(BaseHTTPRequestHandler):
         path,query=self.route()
         if path=="/assets/style.css": return self.send_bytes((BASE_DIR/"style.css").read_bytes(),content_type="text/css; charset=utf-8")
         if path=="/assets/app.js": return self.send_bytes((BASE_DIR/"app.js").read_bytes(),content_type="application/javascript; charset=utf-8")
-        if path=="/favicon.ico": return self.send_bytes(b"",204,"image/x-icon")
+        if path=="/logo.png": return self.send_bytes((BASE_DIR/"public"/"logo.png").read_bytes(), content_type="image/png")
+        if path=="/favicon.ico": return self.send_bytes((BASE_DIR/"public"/"logo.png").read_bytes(), content_type="image/png")
         if path=="/health": return self.text(json.dumps({"status":"ok","python":"source-runtime","database":"supabase-postgresql"}),content_type="application/json")
         if path=="/login":
             user,_=self.current_session(); return self.redirect("/") if user else self.text(self.login_page(query))
         if path=="/verify-otp":
             user,_=self.current_session(); return self.redirect("/") if user else self.text(self.verify_otp_page(query))
         if path=="/register":
-            content=f'<div class="login-page"><div class="login-card"><div class="brandmark">V</div><h1>Create your Vtab identity</h1><form method="post" action="/register" class="grid-form"><div class="field full"><label>Full name</label><input name="name" required></div><div class="field full"><label>Work email</label><input type="email" name="email" required></div><div class="field"><label>Department</label><input name="department" required></div><div class="field"><label>Employee ID</label><input name="employee_id" required></div><div class="field full"><label>Password</label><input type="password" name="password" minlength="8" required></div><button class="btn">Create employee account</button></form><p><a href="/login">Back to sign in</a></p></div></div>'; return self.text(self.layout("Register",content))
+            content=f'<div class="login-page"><div class="login-card"><img class="brandmark" src="/logo.png" alt="VTAB 365"><h1>Create your Vtab identity</h1><form method="post" action="/register" class="grid-form"><div class="field full"><label>Full name</label><input name="name" required></div><div class="field full"><label>Work email</label><input type="email" name="email" required></div><div class="field"><label>Department</label><input name="department" required></div><div class="field"><label>Employee ID</label><input name="employee_id" required></div><div class="field full"><label>Password</label><input type="password" name="password" minlength="8" required></div><button class="btn">Create employee account</button></form><p><a href="/login">Back to sign in</a></p></div></div>'; return self.text(self.layout("Register",content))
         user,session=self.require_user()
         if not user: return
         if path=="/": return self.text(self.dashboard(user,session,query))
