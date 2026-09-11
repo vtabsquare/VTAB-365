@@ -604,7 +604,7 @@ class VtabHandler(BaseHTTPRequestHandler):
                 "email": user["email"],
                 "name": user["name"],
                 "iat": int(datetime.now(timezone.utc).timestamp()),
-                "exp": int((datetime.now(timezone.utc) + timedelta(minutes=2)).timestamp()),
+                "exp": int((datetime.now(timezone.utc) + timedelta(minutes=10)).timestamp()),
                 "jti": str(uuid.uuid4())
             }
             def b64url(b): return base64.urlsafe_b64encode(b).replace(b'=', b'').decode('ascii')
