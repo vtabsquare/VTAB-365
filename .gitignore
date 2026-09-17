@@ -15,3 +15,8 @@ venv.bak/
 # SQLite database
 *.db
 vtab_office_suite.db
+
+# Local dev server launcher - contains secrets, never commit
+start_server.py
+test_login.py
+app.old.py

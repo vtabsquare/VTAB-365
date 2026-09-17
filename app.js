@@ -7,3 +7,55 @@ document.addEventListener('input',e=>{if(e.target.id==='app-logo-value'){const p
 document.addEventListener('change',e=>{if(e.target.matches('.quick-choice input')){const checked=document.querySelectorAll('.quick-choice input:checked');if(checked.length>6){e.target.checked=false;alert('Choose up to 6 applications for Quick Access.')}}});
 document.addEventListener('DOMContentLoaded',()=>{const wanted=new URLSearchParams(location.search).get('tab')||location.hash.slice(1);const tab=wanted&&document.querySelector(`.tab[data-tab="${wanted}"]`);if(tab)tab.click()});
 setTimeout(()=>document.querySelectorAll('.flash').forEach(x=>x.style.display='none'),5000);
+
+// More-details button — use capture phase to run BEFORE the card-launch-link intercepts
+document.addEventListener('click', function(e) {
+    const btn = e.target.closest('.more-details-btn');
+    if (!btn) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    e.stopPropagation();
+
+    const modal = document.getElementById('app-details-modal');
+    if (!modal) return;
+
+    // Populate text fields from data attributes on the button
+    document.getElementById('modal-app-name').textContent = btn.dataset.appName || '';
+    document.getElementById('modal-app-desc').textContent = btn.dataset.appDesc || '';
+    document.getElementById('modal-app-cat').textContent = btn.dataset.appCat || '';
+    document.getElementById('modal-app-version').textContent = btn.dataset.appVersion || '';
+    document.getElementById('modal-app-pub').textContent = btn.dataset.appPub || '';
+
+    // Populate Icon HTML from nearest icon-wrap
+    const iconWrap = btn.closest('.app-top') && btn.closest('.app-top').querySelector('.app-icon-wrap');
+    if (iconWrap && iconWrap.dataset.html) {
+        document.getElementById('modal-app-icon').innerHTML = iconWrap.dataset.html;
+    }
+
+    // Set launch link href
+    const card = btn.closest('.app-card');
+    const launchLink = card && card.querySelector('.card-launch-link');
+    const launchBtn = document.getElementById('modal-launch-btn');
+    if (launchBtn && launchLink) {
+        launchBtn.href = launchLink.href || '#';
+        if (launchLink.target) {
+            launchBtn.setAttribute('target', launchLink.target);
+            launchBtn.setAttribute('rel', 'noopener');
+        } else {
+            launchBtn.removeAttribute('target');
+            launchBtn.removeAttribute('rel');
+        }
+    }
+
+    modal.classList.add('open');
+}, true); // capture=true: runs before any bubbling handlers
+
+// Close modal when clicking backdrop
+document.addEventListener('click', function(e) {
+    const modal = document.getElementById('app-details-modal');
+    if (modal && modal.classList.contains('open') && e.target === modal) {
+        modal.classList.remove('open');
+    }
+});
+
+window.openAppModal = function(e, btn) { /* legacy shim - handled by delegation above */ };
