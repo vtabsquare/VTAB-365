@@ -19,7 +19,9 @@ import sqlite3
 import secrets
 from typing import Any
 import urllib.parse
+import logging
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_URL = None
@@ -328,7 +330,7 @@ def get_launch_attrs(app: dict) -> str:
 
 def application_card(app: dict, admin: bool = False) -> str:
     label = "Admin only" if admin or app["visibility"] == "admins" else "Workspace"
-    return f'<div class="card app-card" data-category="{esc(app["category"])}" data-search="{esc((app["name"]+" "+app["description"]).lower())}" style="--app-tint:{esc(app["color"])}18"><a class="card-launch-link" {get_launch_attrs(app)}></a><div class="app-top"><div class="app-icon-wrap" data-html="{esc(product_icon(app))}">{product_icon(app)}</div><div class="app-top-right"><span class="visibility-pill {"admins" if label == "Admin only" else ""}">{label}</span><button class="icon-btn more-details-btn" title="More details" onclick="openAppModal(event, this)" data-app-name="{esc(app["name"])}" data-app-desc="{esc(app["description"])}" data-app-cat="{esc(app["category"].title())}" data-app-version="{esc(app["version"])}" data-app-pub="{esc(app["publisher"])}"><svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg></button></div></div><h3 class="app-card-title">{esc(app["name"])}</h3><p class="app-card-desc">{esc(app["description"])}</p><div class="meta"><span class="app-card-cat">{esc(app["category"].title())}</span><span class="app-card-version">{esc(app["version"])}</span><span class="app-card-pub" hidden>{esc(app["publisher"])}</span></div></div>'
+    return f'<div class="card app-card" data-category="{esc(app["category"])}" data-search="{esc((app["name"]+" "+app["description"]).lower())}" style="--app-tint:{esc(app["color"])}18"><a class="card-launch-link" {get_launch_attrs(app)} aria-label="Launch {esc(app["name"])}"></a><div class="app-top"><div class="app-icon-wrap" data-html="{esc(product_icon(app))}">{product_icon(app)}</div><div class="app-top-right"><span class="visibility-pill {"admins" if label == "Admin only" else ""}">{label}</span><button class="icon-btn more-details-btn" title="More details" aria-label="More details about {esc(app["name"])}" onclick="openAppModal(event, this)" data-app-name="{esc(app["name"])}" data-app-desc="{esc(app["description"])}" data-app-cat="{esc(app["category"].title())}" data-app-version="{esc(app["version"])}" data-app-pub="{esc(app["publisher"])}"><svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg></button></div></div><h3 class="app-card-title">{esc(app["name"])}</h3><p class="app-card-desc">{esc(app["description"])}</p><div class="meta"><span class="app-card-cat">{esc(app["category"].title())}</span><span class="app-card-version">{esc(app["version"])}</span><span class="app-card-pub" hidden>{esc(app["publisher"])}</span></div></div>'
 
 
 def send_email_otp(to_email: str, otp_code: str):
@@ -360,13 +362,13 @@ def send_email_otp(to_email: str, otp_code: str):
         with urllib.request.urlopen(req) as res:
             pass
     except Exception as e:
-        print(f"Failed to send OTP email: {e}")
+        logging.error(f"Failed to send OTP email: {e}", exc_info=True)
 
 class VtabHandler(BaseHTTPRequestHandler):
     server_version = "VtabOffice/7.0"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"[{self.log_date_time_string()}] {fmt % args}")
+        logging.info(f"{self.client_address[0]} - {fmt % args}")
 
     def send_bytes(self, body: bytes, status: int = 200, content_type: str = "text/html; charset=utf-8", headers: dict[str, str] | None = None) -> None:
         self.send_response(status)
@@ -462,12 +464,12 @@ class VtabHandler(BaseHTTPRequestHandler):
         side_apps = "".join(f'<a {get_launch_attrs(a)}>{product_icon(a,True)}<span>{esc(a["name"])}</span></a>' for a in pinned)
         initials = "".join(part[0] for part in user["name"].split()[:2]).upper()
         add = f'<a class="btn" href="/admin">{nav_icon("plus")}Add app</a>' if user["role"] == "Administrator" else ""
-        modal_html = '<div id="app-details-modal" class="modal"><div class="modal-card premium-modal"><div class="premium-modal-bg"></div><div class="modal-header"><div id="modal-app-icon"></div><h2 id="modal-app-name"></h2></div><div class="modal-body"><p id="modal-app-desc"></p><div class="modal-meta"><div class="meta-item"><strong>Category</strong><span id="modal-app-cat"></span></div><div class="meta-item"><strong>Version</strong><span id="modal-app-version"></span></div><div class="meta-item"><strong>Publisher</strong><span id="modal-app-pub"></span></div></div></div><div class="modal-actions"><a id="modal-launch-btn" class="btn launch-btn" href="#">Open application</a><button class="btn secondary cancel-btn" data-close="app-details-modal">Cancel</button></div></div></div>'
+        modal_html = '<div id="app-details-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-app-name" aria-hidden="true"><div class="modal-card premium-modal" tabindex="-1"><div class="premium-modal-bg" aria-hidden="true"></div><div class="modal-header"><div id="modal-app-icon" aria-hidden="true"></div><h2 id="modal-app-name"></h2></div><div class="modal-body"><p id="modal-app-desc"></p><div class="modal-meta"><div class="meta-item"><strong>Category</strong><span id="modal-app-cat"></span></div><div class="meta-item"><strong>Version</strong><span id="modal-app-version"></span></div><div class="meta-item"><strong>Publisher</strong><span id="modal-app-pub"></span></div></div></div><div class="modal-actions"><a id="modal-launch-btn" class="btn launch-btn" href="#">Open application</a><button class="btn secondary cancel-btn" data-close="app-details-modal" aria-label="Cancel">Cancel</button></div></div></div>'
         return head + f'<div class="shell"><aside class="sidebar"><div class="brand"><img class="brandmark" src="/logo.png" alt="VTAB 365"><div><strong>Vtab 365</strong><small>Office workspace</small></div></div><nav class="nav"><div class="nav-label">Workspace</div><a class="{"active" if active=="home" else ""}" href="/">{nav_icon("home")}<span>Home</span></a><a class="{"active" if active=="apps" else ""}" href="/apps">{nav_icon("apps")}<span>All applications</span></a><a class="{"active" if active=="updates" else ""}" href="/updates">{nav_icon("news")}<span>What\'s new</span></a><a class="{"active" if active=="sso" else ""}" href="/sso">{nav_icon("shield")}<span>Security &amp; SSO</span></a>{admin_nav}<div class="sidebar-section-head"><div class="nav-label">Quick access</div><a class="quick-settings" href="/quick-access">Customize</a></div><div class="sidebar-apps">{side_apps}</div></nav><div class="side-user"><div class="avatar">{esc(initials)}</div><div class="user-copy"><strong>{esc(user["name"])}</strong><small>{esc(user["role"])}</small><small>{esc(user["email"])}</small></div></div></aside><section class="main"><header class="topbar"><div class="top-search">{nav_icon("search")}<input id="app-search" class="search" placeholder="Search applications"></div><div class="actions">{add}<div class="top-avatar">{esc(initials[:1])}</div><form method="post" action="/logout"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><button class="btn secondary icon-btn" title="Sign out" aria-label="Sign out">{nav_icon("logout")}</button></form></div></header><main class="content">{flashes}{content}</main></section></div>{modal_html}<script src="/assets/app.js?v=4"></script></body></html>'
 
     def login_page(self, query: dict[str, list[str]]) -> str:
         error = f'<div class="flash error">{esc(query["error"][0])}</div>' if query.get("error") else ""
-        content = f'<div class="login-page"><div class="login-card"><img class="brandmark" src="/logo.png" alt="VTAB 365"><h1>Welcome to Vtab 365</h1><p>One secure account for every workplace application.</p>{error}<form method="post" action="/login" class="grid-form"><div class="field full"><label>Work email</label><input type="email" name="email" required></div><div class="field full"><label>Password</label><input type="password" name="password" required></div><div class="field full"><button class="btn">Sign in to workspace</button></div></form><p style="text-align:center"><a href="/register">Create an employee account</a></p><p style="text-align:center;margin-top:12px"><a href="https://www.vtabsquare.com/?demo=1&amp;product=vtab-office-suite-365&amp;source=vtab365-demo" target="_blank" rel="noopener noreferrer">Contact for Demo ↗</a></p></div></div>'
+        content = f'<div class="login-page"><div class="login-card"><img class="brandmark" src="/logo.png" alt="VTAB 365"><h1>Welcome to Vtab 365</h1><p>One secure account for every workplace application.</p>{error}<form method="post" action="/login" class="grid-form"><div class="field full"><label>Work email</label><input type="email" name="email" required></div><div class="field full"><label>Password</label><input type="password" name="password" required></div><div class="field full"><button class="btn">Sign in to workspace</button></div></form><p style="text-align:center"><a href="/forgot-password">Forgot password?</a> &middot; <a href="/register">Create an employee account</a></p><p style="text-align:center;margin-top:12px"><a href="https://www.vtabsquare.com/?demo=1&amp;product=vtab-office-suite-365&amp;source=vtab365-demo" target="_blank" rel="noopener noreferrer">Contact for Demo ↗</a></p></div></div>'
         return self.layout("Sign in", content)
 
     def verify_otp_page(self, query: dict[str, list[str]]) -> str:
@@ -591,6 +593,11 @@ class VtabHandler(BaseHTTPRequestHandler):
             user,_=self.current_session(); return self.redirect("/") if user else self.text(self.verify_otp_page(query))
         if path=="/register":
             content=f'<div class="login-page"><div class="login-card"><img class="brandmark" src="/logo.png" alt="VTAB 365"><h1>Create your Vtab identity</h1><form method="post" action="/register" class="grid-form"><div class="field full"><label>Full name</label><input name="name" required></div><div class="field full"><label>Work email</label><input type="email" name="email" required></div><div class="field"><label>Department</label><input name="department" required></div><div class="field"><label>Employee ID</label><input name="employee_id" required></div><div class="field full"><label>Password</label><input type="password" name="password" minlength="8" required></div><button class="btn">Create employee account</button></form><p><a href="/login">Back to sign in</a></p></div></div>'; return self.text(self.layout("Register",content))
+        if path=="/forgot-password":
+            content=f'<div class="login-page"><div class="login-card"><img class="brandmark" src="/logo.png" alt="VTAB 365"><h1>Forgot Password</h1><p>Enter your work email and we will send you a secure OTP to reset your password.</p><form method="post" action="/forgot-password" class="grid-form"><div class="field full"><label>Work email</label><input type="email" name="email" required></div><div class="field full"><button class="btn">Send recovery code</button></div></form><p style="text-align:center"><a href="/login">Back to sign in</a></p></div></div>'; return self.text(self.layout("Forgot Password", content))
+        if path=="/reset-password":
+            error = f'<div class="flash error">{esc(query["error"][0])}</div>' if query.get("error") else ""
+            content=f'<div class="login-page"><div class="login-card"><img class="brandmark" src="/logo.png" alt="VTAB 365"><h1>Reset Password</h1><p>Enter the 6-digit code sent to your email and your new password.</p>{error}<form method="post" action="/reset-password" class="grid-form"><div class="field full"><label>Work email</label><input type="email" name="email" required value="{esc(query.get("email", [""])[0])}"></div><div class="field full"><label>Verification Code</label><input type="text" name="otp_code" required autocomplete="off" placeholder="123456"></div><div class="field full"><label>New Password</label><input type="password" name="new_password" required minlength="8"></div><div class="field full"><button class="btn">Reset and Sign in</button></div></form><p style="text-align:center"><a href="/login">Back to sign in</a></p></div></div>'; return self.text(self.layout("Reset Password", content))
         user,session=self.require_user()
         if not user: return
         if path=="/": return self.text(self.dashboard(user,session,query))
@@ -686,6 +693,28 @@ class VtabHandler(BaseHTTPRequestHandler):
                     uid=con.execute("INSERT INTO users(name,email,password_hash,role,department,employee_id,registered_at) VALUES(%s,%s,%s,'Employee',%s,%s,%s) RETURNING id",(name,email,password_hash(password),form.get("department","General"),form.get("employee_id",""),datetime.now().date().isoformat())).fetchone()["id"]
             except sqlite3.IntegrityError: return self.flash("/register","Email or employee ID already exists.",True)
             return self.redirect("/",self.new_session(uid))
+        if path=="/forgot-password":
+            email = form.get("email", "").strip().lower()
+            with db() as con: user = con.execute("SELECT * FROM users WHERE email=%s AND active=1", (email,)).fetchone()
+            if user:
+                import random
+                otp = str(random.randint(100000, 999999))
+                with db() as con: con.execute("INSERT INTO login_otps (email, otp_code) VALUES (%s, %s)", (user["email"], otp))
+                send_email_otp(user["email"], otp)
+            import urllib.parse
+            return self.redirect(f"/reset-password?email={urllib.parse.quote(email)}")
+        if path=="/reset-password":
+            import urllib.parse
+            email, otp_code, new_password = form.get("email", "").strip().lower(), form.get("otp_code", "").strip(), form.get("new_password", "")
+            if len(new_password) < 8: return self.flash(f"/reset-password?email={urllib.parse.quote(email)}", "Password must be at least 8 characters.", True)
+            with db() as con:
+                otp_record = con.execute("SELECT * FROM login_otps WHERE email=%s AND otp_code=%s AND created_at >= NOW() - INTERVAL '5 minutes' ORDER BY created_at DESC LIMIT 1", (email, otp_code)).fetchone()
+                if not otp_record: return self.flash(f"/reset-password?email={urllib.parse.quote(email)}", "Invalid or expired verification code.", True)
+                con.execute("DELETE FROM login_otps WHERE email=%s", (email,))
+                con.execute("UPDATE users SET password_hash=%s WHERE email=%s", (password_hash(new_password), email))
+                user = con.execute("SELECT * FROM users WHERE email=%s AND active=1", (email,)).fetchone()
+            self.audit("PASSWORD_RESET", user["email"], "User reset their password via OTP.")
+            return self.redirect("/", self.new_session(user["id"]))
         user,session=self.require_user()
         if not user: return
         if not self.check_csrf(form,session): return self.text(self.layout("Invalid request",'<div class="panel"><h2>Security check failed</h2></div>',user,session),403)
@@ -719,6 +748,7 @@ class VtabHandler(BaseHTTPRequestHandler):
             try:
                 with db() as con: con.execute("INSERT INTO applications(slug,name,description,category,icon,color,url,sso_mode,enabled,built_in,allowed_roles,version,publisher,created_at,visibility,logo_url) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,1,0,%s,%s,%s,%s,%s,%s)",(slug,form.get("name","")[:80],form.get("description","")[:400],form.get("category","custom"),form.get("icon","AP")[:3].upper(),color.upper(),form.get("url","")[:500],form.get("sso_mode","oidc"),'["All Employees"]',form.get("version","v1.0.0")[:30],form.get("publisher","Vtab IT")[:100],now_iso(),visibility,logo))
             except sqlite3.IntegrityError: return self.flash("/admin","Application slug already exists.",True)
+            self.audit("APP_CREATED", user["email"], f"Created application {slug}", slug)
             return self.flash("/admin","Application added.")
         if path=="/admin/apps/update":
             app_id=form.get("id")
@@ -734,28 +764,35 @@ class VtabHandler(BaseHTTPRequestHandler):
                 if "unique" in str(e).lower() or isinstance(e, sqlite3.IntegrityError):
                     return self.flash(f"/admin/apps/edit?id={app_id}","Application slug already exists.",True)
                 raise
+            self.audit("APP_UPDATED", user["email"], f"Updated application {slug}", slug)
             return self.flash("/admin?tab=manage","Application updated.")
         if path=="/admin/apps/settings":
             visibility=form.get("visibility","everyone"); visibility=visibility if visibility in {"everyone","admins"} else "everyone"
             with db() as con: con.execute("UPDATE applications SET visibility=%s WHERE id=%s",(visibility,form.get("id")))
+            self.audit("APP_VISIBILITY_CHANGED", user["email"], f"Changed visibility to {visibility}", form.get("id"))
             return self.flash("/admin?tab=manage","Visibility updated.")
         if path=="/admin/users/role":
             role=form.get("role","Employee"); role=role if role in {"Employee","Administrator"} else "Employee"
             with db() as con: con.execute("UPDATE users SET role=%s WHERE id=%s",(role,form.get("id")))
+            self.audit("USER_ROLE_CHANGED", user["email"], f"Changed user {form.get('id')} role to {role}")
             return self.flash("/admin?tab=users","User role updated.")
         if path=="/admin/apps/toggle":
             with db() as con: con.execute("UPDATE applications SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=%s",(form.get("id"),))
+            self.audit("APP_STATUS_TOGGLED", user["email"], f"Toggled status for app {form.get('id')}", form.get("id"))
             return self.flash("/admin?tab=manage","Application status updated.")
         if path=="/admin/apps/delete":
             with db() as con: con.execute("DELETE FROM applications WHERE id=%s AND built_in=0",(form.get("id"),))
+            self.audit("APP_DELETED", user["email"], f"Deleted application {form.get('id')}", form.get("id"))
             return self.flash("/admin?tab=manage","Application removed.")
         if path=="/admin/announcements/create":
             try: progress=max(0,min(100,int(form.get("progress_percent","0") or 0)))
             except ValueError: progress=0
             with db() as con: con.execute("INSERT INTO announcements(title,app_name,version,description,status,created_at,release_date,highlights,progress_percent) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",(form.get("title","")[:120],form.get("app_name","")[:100],form.get("version","v1.0")[:40],form.get("description","")[:600],form.get("status","Coming Soon"),now_iso(),form.get("release_date","")[:80],form.get("highlights","")[:500],progress))
+            self.audit("RELEASE_PUBLISHED", user["email"], f"Published release: {form.get('title')}")
             return self.flash("/admin?tab=upcoming","Release information published.")
         if path=="/admin/announcements/delete":
             with db() as con: con.execute("DELETE FROM announcements WHERE id=%s",(form.get("id"),))
+            self.audit("RELEASE_DELETED", user["email"], f"Deleted release {form.get('id')}")
             return self.flash("/admin?tab=upcoming","Release information removed.")
         return self.text("Not found",404)
 
@@ -790,13 +827,13 @@ if __name__ == "__main__":
         except Exception as _e:
             if _attempt == 29:
                 raise
-            print(f"[VTAB] DB not ready yet ({_e}). Retrying in 10 seconds... (attempt {_attempt+1}/30)")
+            logging.warning(f"[VTAB] DB not ready yet ({_e}). Retrying in 10 seconds... (attempt {_attempt+1}/30)")
             _time.sleep(10)
-    print("Vtab Office Suite 365 V7 — PostgreSQL (Supabase) edition")
-    print(f"Database: Supabase PostgreSQL")
-    print(f"Open http://{HOST}:{PORT} in your browser")
+    logging.info("Vtab Office Suite 365 V7 — PostgreSQL (Supabase) edition")
+    logging.info("Database: Supabase PostgreSQL")
+    logging.info(f"Open http://{HOST}:{PORT} in your browser")
     if SECRET_KEY == b"vtab-local-development-key-change-me":
-        print("Development mode: set VTAB_SECRET_KEY before production use.")
+        logging.warning("Development mode: set VTAB_SECRET_KEY before production use.")
     try: ThreadingHTTPServer((HOST,PORT),VtabHandler).serve_forever()
-    except KeyboardInterrupt: print("\nServer stopped.")
+    except KeyboardInterrupt: logging.info("Server stopped.")
 

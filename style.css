@@ -150,3 +150,16 @@ body{font-family:Inter,"Segoe UI Variable","Segoe UI",Arial,sans-serif;backgroun
 }
 .more-details-btn svg { width: 15px; height: 15px; opacity: 0.8; }
 .more-details-btn:hover { background: #fff; color: var(--brand); transform: scale(1.1); box-shadow: 0 6px 16px rgba(91,92,226,0.18); border-color: rgba(91,92,226,0.1); }
+
+/* Accessibility Focus States */
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 3px solid var(--brand);
+  outline-offset: 2px;
+}
+.card-launch-link:focus-visible::before {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  outline: 3px solid var(--brand);
+  border-radius: inherit;
+}

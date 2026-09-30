@@ -1,59 +1,35 @@
-# Vtab Office Suite 365 — Python Edition V7
+# VTAB Office Suite 365
 
-V7 is a fully source-based rebuild compatible with Python 3.14. It removes the version-specific `runtime.pkl` and `cloudpickle` components used in V6.
+VTAB 365 is a centralized enterprise workspace portal. It serves as an application launcher and a Single Sign-On (SSO) Identity Provider for downstream corporate applications.
 
-## Run in VS Code
+## Features
+* **Secure Authentication:** Passwordless-style OTP verification via Brevo email API.
+* **SSO Provider:** Generates cryptographically signed JWT assertions for downstream apps.
+* **Workspace Launcher:** Role-based application grids and customizable "Quick Access" tiles.
+* **Admin Portal:** Full CRUD management for applications, user roles, and release announcements.
+* **Audit Trail:** Comprehensive security logging for logins, app launches, and administrative actions.
 
-Open this folder and run:
+## Prerequisites
+* **Python 3.10+**
+* **PostgreSQL Database** (e.g., Supabase)
+* **Brevo Account** (for sending OTP emails)
 
-```powershell
-python app.py
-```
+## Environment Variables
+The application strictly follows 12-factor app principles. You must define the following environment variables before starting the server (typically handled in `start_server.py`):
 
-Or use your selected Python 3.14 interpreter:
+* `DATABASE_URL` - Your PostgreSQL connection string.
+* `VTAB_SECRET_KEY` - A secure random string used to cryptographically sign HTTP sessions.
+* `VTAB_SSO_SECRET` - A secure random string used to sign outgoing SSO JWTs.
+* `BREVO_API_KEY` - Your Brevo v3 API key for sending emails.
 
-```powershell
-& C:\Users\ADMIN\AppData\Local\Python\pythoncore-3.14-64\python.exe app.py
-```
+## Running the Application
+1. Ensure your dependencies are installed (e.g., `psycopg2`).
+2. Do not commit `start_server.py` if it contains hardcoded secrets (it is in `.gitignore`).
+3. Run the server:
+   ```bash
+   python start_server.py
+   ```
+4. Open your browser and navigate to `http://localhost:8000`.
 
-Then open <http://127.0.0.1:8000>.
-
-Keep the following files together:
-
-- `app.py`
-- `style.css`
-- `app.js`
-- `vtab_office_suite.db`
-
-No third-party Python packages, Node.js, React, Flask or npm are required.
-
-## Demo accounts
-
-| Access | Email | Password |
-|---|---|---|
-| Administrator | `admin@vtaboffice365.com` | `Admin@123` |
-| Employee | `user@vtaboffice365.com` | `User@123` |
-
-Change these passwords before using real company data.
-
-## Included functionality
-
-- Unified database-backed login and secure sessions
-- Quick Access customization
-- General and administrator-only application launchers
-- Application creation, visibility, logo and brand-color controls
-- Release publishing and detailed release centre
-- HR leave requests, self-appraisals and payroll payslip downloads
-- Security audit history and application registry API
-- Responsive desktop and mobile interface
-
-## Configuration
-
-```powershell
-$env:VTAB_SECRET_KEY = "replace-with-a-long-random-secret"
-$env:VTAB_HOST = "127.0.0.1"
-$env:VTAB_PORT = "8000"
-python app.py
-```
-
-Set `VTAB_DB_PATH` to use a different SQLite database location.
+## Architecture
+This application is built as a lightweight, zero-dependency (framework-wise) Python server using `BaseHTTPRequestHandler` and `ThreadingHTTPServer`. It uses standard HTML/CSS/JS on the frontend with server-side rendering.
