@@ -163,3 +163,75 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
   outline: 3px solid var(--brand);
   border-radius: inherit;
 }
+
+/* Pilot / Demo Mode Styles */
+.demo-faded-nav {
+  opacity: 0.38 !important;
+  cursor: not-allowed !important;
+  filter: grayscale(0.85);
+  position: relative;
+}
+.demo-faded-nav:hover {
+  background: transparent !important;
+}
+.demo-tag {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(234, 179, 8, 0.16);
+  color: #d97706;
+  border: 1px solid rgba(234, 179, 8, 0.35);
+}
+.demo-banner {
+  background: linear-gradient(135deg, rgba(234, 179, 8, 0.1), rgba(91, 92, 226, 0.1));
+  border: 1px solid rgba(234, 179, 8, 0.3);
+  border-radius: 12px;
+  padding: 12px 18px;
+  margin-bottom: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 13px;
+  color: #1e293b;
+}
+.demo-banner strong {
+  color: #b45309;
+}
+.demo-modal-dialog {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(9, 17, 33, 0.75);
+  backdrop-filter: blur(8px);
+  z-index: 1000;
+  place-items: center;
+  padding: 20px;
+}
+.demo-modal-dialog.open {
+  display: grid;
+}
+.demo-modal-box {
+  background: #ffffff;
+  border-radius: 20px;
+  width: min(480px, 100%);
+  padding: 28px;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.35);
+  text-align: center;
+  position: relative;
+}
+.demo-badge-wrap {
+  width: 54px;
+  height: 54px;
+  border-radius: 16px;
+  background: rgba(234, 179, 8, 0.14);
+  color: #d97706;
+  font-size: 24px;
+  display: grid;
+  place-items: center;
+  margin: 0 auto 16px;
+}

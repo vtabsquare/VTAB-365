@@ -59,3 +59,30 @@ document.addEventListener('click', function(e) {
 });
 
 window.openAppModal = function(e, btn) { /* legacy shim - handled by delegation above */ };
+
+// Demo / Pilot Mode Modal Handlers
+window.openDemoModal = function(e, appName) {
+    if (e) {
+        e.preventDefault();
+        e.stopPropagation();
+    }
+    const detailsModal = document.getElementById('app-details-modal');
+    if (detailsModal) detailsModal.classList.remove('open');
+    const demoModal = document.getElementById('demo-version-modal');
+    if (!demoModal) return;
+    const target = document.getElementById('demo-modal-app-name');
+    if (target && appName) target.textContent = appName;
+    demoModal.classList.add('open');
+};
+
+window.closeDemoModal = function() {
+    const demoModal = document.getElementById('demo-version-modal');
+    if (demoModal) demoModal.classList.remove('open');
+};
+
+document.addEventListener('click', function(e) {
+    const modal = document.getElementById('demo-version-modal');
+    if (modal && modal.classList.contains('open') && e.target === modal) {
+        modal.classList.remove('open');
+    }
+});
