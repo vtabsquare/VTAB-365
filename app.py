@@ -20,6 +20,8 @@ import secrets
 from typing import Any
 import urllib.parse
 import logging
+from vtab_identity import (IDENTITY_COOKIE, cookie_header, production_host, read_cookie,
+                           issue_vtab_token, verify_vtab_token, require_secret)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
@@ -322,15 +324,18 @@ def product_icon(app: dict, small: bool = False) -> str:
     return f'<span class="product-icon{size}" style="--app-color:{esc(app["color"])}">{content}</span>'
 
 
-def get_launch_attrs(app: dict) -> str:
+def get_launch_attrs(app: dict, is_demo: bool = False) -> str:
+    if is_demo:
+        name = esc(app.get("name", "Application"))
+        return f'href="javascript:void(0)" onclick="openDemoModal(event, \'{name}\')" aria-label="Demo preview of {name}"'
     if app.get("url") and app["url"].startswith("http"):
         href = f"/api/sso/token?app={esc(app['slug'])}" if app.get("sso_mode") == "vtab_assertion" else esc(app["url"])
         return f'href="{href}" target="_blank" rel="noopener"'
     return f'href="{esc(app.get("url") or "/app/" + str(app.get("slug")))}"'
 
-def application_card(app: dict, admin: bool = False) -> str:
+def application_card(app: dict, admin: bool = False, is_demo: bool = False) -> str:
     label = "Admin only" if admin or app["visibility"] == "admins" else "Workspace"
-    return f'<div class="card app-card" data-category="{esc(app["category"])}" data-search="{esc((app["name"]+" "+app["description"]).lower())}" style="--app-tint:{esc(app["color"])}18"><a class="card-launch-link" {get_launch_attrs(app)} aria-label="Launch {esc(app["name"])}"></a><div class="app-top"><div class="app-icon-wrap" data-html="{esc(product_icon(app))}">{product_icon(app)}</div><div class="app-top-right"><span class="visibility-pill {"admins" if label == "Admin only" else ""}">{label}</span><button class="icon-btn more-details-btn" title="More details" aria-label="More details about {esc(app["name"])}" onclick="openAppModal(event, this)" data-app-name="{esc(app["name"])}" data-app-desc="{esc(app["description"])}" data-app-cat="{esc(app["category"].title())}" data-app-version="{esc(app["version"])}" data-app-pub="{esc(app["publisher"])}"><svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg></button></div></div><h3 class="app-card-title">{esc(app["name"])}</h3><p class="app-card-desc">{esc(app["description"])}</p><div class="meta"><span class="app-card-cat">{esc(app["category"].title())}</span><span class="app-card-version">{esc(app["version"])}</span><span class="app-card-pub" hidden>{esc(app["publisher"])}</span></div></div>'
+    return f'<div class="card app-card" data-category="{esc(app["category"])}" data-search="{esc((app["name"]+" "+app["description"]).lower())}" style="--app-tint:{esc(app["color"])}18"><a class="card-launch-link" {get_launch_attrs(app, is_demo)} aria-label="Launch {esc(app["name"])}"></a><div class="app-top"><div class="app-icon-wrap" data-html="{esc(product_icon(app))}">{product_icon(app)}</div><div class="app-top-right"><span class="visibility-pill {"admins" if label == "Admin only" else ""}">{label}</span><button class="icon-btn more-details-btn" title="More details" aria-label="More details about {esc(app["name"])}" onclick="openAppModal(event, this)" data-app-name="{esc(app["name"])}" data-app-desc="{esc(app["description"])}" data-app-cat="{esc(app["category"].title())}" data-app-version="{esc(app["version"])}" data-app-pub="{esc(app["publisher"])}"><svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg></button></div></div><h3 class="app-card-title">{esc(app["name"])}</h3><p class="app-card-desc">{esc(app["description"])}</p><div class="meta"><span class="app-card-cat">{esc(app["category"].title())}</span><span class="app-card-version">{esc(app["version"])}</span><span class="app-card-pub" hidden>{esc(app["publisher"])}</span></div></div>'
 
 
 def send_email_otp(to_email: str, otp_code: str):
@@ -370,22 +375,22 @@ class VtabHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         logging.info(f"{self.client_address[0]} - {fmt % args}")
 
-    def send_bytes(self, body: bytes, status: int = 200, content_type: str = "text/html; charset=utf-8", headers: dict[str, str] | None = None) -> None:
+    def send_bytes(self, body: bytes, status: int = 200, content_type: str = "text/html; charset=utf-8", headers: dict[str, str | list[str]] | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "SAMEORIGIN")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data: https:; form-action 'self'; frame-ancestors 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; form-action 'self'; frame-ancestors 'self' https://*.vtabsquare.com https://vtabsquare.com http://localhost:*")
         for key, value in (headers or {}).items():
-            self.send_header(key, value)
+            for item in (value if isinstance(value, list) else [value]):
+                self.send_header(key, item)
         self.end_headers()
         self.wfile.write(body)
 
-    def text(self, value: str, status: int = 200, content_type: str = "text/html; charset=utf-8", headers: dict[str, str] | None = None) -> None:
+    def text(self, value: str, status: int = 200, content_type: str = "text/html; charset=utf-8", headers: dict[str, str | list[str]] | None = None) -> None:
         self.send_bytes(value.encode("utf-8"), status, content_type, headers)
 
-    def redirect(self, target: str, cookie: str | None = None) -> None:
+    def redirect(self, target: str, cookie: str | list[str] | None = None) -> None:
         headers = {"Location": target}
         if cookie:
             headers["Set-Cookie"] = cookie
@@ -407,19 +412,65 @@ class VtabHandler(BaseHTTPRequestHandler):
         with db() as con:
             con.execute("INSERT INTO audit_logs(created_at,event_type,user_email,app_name,details,status) VALUES(%s,%s,%s,%s,%s,%s)", (now_iso(),event,email,app,details,status))
 
-    def new_session(self, user_id: int) -> str:
+    def auth_cookies(self, user, sid, expiry, federated):
+        host = self.headers.get("Host", "")
+        shared = federated and user["role"] != "Demo" and SECRET_KEY != b"vtab-local-development-key-change-me" and len(SECRET_KEY) >= 32
+        signature = hmac.new(SECRET_KEY, sid.encode(), hashlib.sha256).hexdigest()
+        result = self.clear_auth_cookies()
+        result.append(cookie_header(COOKIE_NAME, f"{sid}.{signature}", host, shared=shared))
+        if shared:
+            token = issue_vtab_token(user, sid, expiry.timestamp(), SECRET_KEY)
+            result.append(cookie_header(IDENTITY_COOKIE, token, host))
+        return result
+
+    def clear_auth_cookies(self):
+        host = self.headers.get("Host", "")
+        result = []
+        for name in (COOKIE_NAME, IDENTITY_COOKIE):
+            result.append(cookie_header(name, "", host, max_age=0, shared=False))
+            if production_host(host):
+                result.append(cookie_header(name, "", host, max_age=0))
+        result.append(cookie_header("vtab_pending_email", "", host, max_age=0, shared=False))
+        return result
+
+    def new_session(self, user_id: int, federated: bool = False) -> list[str]:
         sid, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
         expiry = datetime.now(timezone.utc) + timedelta(hours=12)
         with db() as con:
+            user = con.execute("SELECT * FROM users WHERE id=%s AND active=1", (user_id,)).fetchone()
+            if not user:
+                raise ValueError("Cannot create a session for an inactive user")
+            # Validate configuration before inserting the session.
+            if production_host(self.headers.get("Host", "")):
+                require_secret(SECRET_KEY)
             con.execute("INSERT INTO sessions(id,user_id,csrf_token,created_at,expires_at) VALUES(%s,%s,%s,%s,%s)", (sid,user_id,csrf,now_iso(),expiry.isoformat()))
-        signature = hmac.new(SECRET_KEY, sid.encode(), hashlib.sha256).hexdigest()
-        return f"{COOKIE_NAME}={sid}.{signature}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200"
+        return self.auth_cookies(user, sid, expiry, federated)
+
+    def verify_identity(self):
+        # No redirects, CORS permission, or shared-secret query parameters.
+        header = self.headers.get("Authorization", "")
+        token = header[7:] if header.startswith("Bearer ") else read_cookie(self.headers.get("Cookie", ""), IDENTITY_COOKIE)
+        payload = verify_vtab_token(token, SECRET_KEY)
+        if not payload:
+            return self.text('{"authenticated":false}', 401, "application/json", {"Cache-Control": "no-store"})
+        try:
+            with db() as con:
+                session = con.execute("SELECT * FROM sessions WHERE id=%s AND expires_at>%s", (payload["sid"], now_iso())).fetchone()
+                user = con.execute("SELECT * FROM users WHERE id=%s AND active=1", (session["user_id"],)).fetchone() if session else None
+            if not user or str(user["id"]) != payload["sub"] or user["role"] == "Demo":
+                return self.text('{"authenticated":false}', 401, "application/json", {"Cache-Control": "no-store"})
+            identity = {key: user[key] for key in ("email", "name", "role", "employee_id")}
+            identity.update(sub=str(user["id"]), exp=payload["exp"])
+            return self.text(json.dumps({"authenticated": True, "identity": identity}), content_type="application/json", headers={"Cache-Control": "no-store"})
+        except Exception:
+            logging.exception("Identity session verification unavailable")
+            return self.text('{"authenticated":false,"error":"verification_unavailable"}', 503, "application/json", {"Cache-Control": "no-store"})
 
     def current_session(self) -> tuple[dict | None, dict | None]:
         jar = cookies.SimpleCookie()
         try:
             jar.load(self.headers.get("Cookie", ""))
-            signed = jar.get(COOKIE_NAME).value if jar.get(COOKIE_NAME) else ""
+            signed = read_cookie(self.headers.get("Cookie", ""), COOKIE_NAME) or ""
             sid, supplied = signed.split(".", 1)
             expected = hmac.new(SECRET_KEY, sid.encode(), hashlib.sha256).hexdigest()
             if not hmac.compare_digest(supplied, expected):
@@ -428,7 +479,7 @@ class VtabHandler(BaseHTTPRequestHandler):
                 session = con.execute("SELECT * FROM sessions WHERE id=%s AND expires_at>%s", (sid,now_iso())).fetchone()
                 user = con.execute("SELECT * FROM users WHERE id=%s AND active=1", (session["user_id"],)).fetchone() if session else None
             return user, session
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, cookies.CookieError):
             return None, None
 
     def require_user(self) -> tuple[dict | None, dict | None]:
@@ -458,14 +509,19 @@ class VtabHandler(BaseHTTPRequestHandler):
             pinned = con.execute("SELECT a.* FROM user_quick_access q JOIN applications a ON a.id=q.app_id WHERE q.user_id=%s AND a.enabled=1 AND (a.visibility='everyone' OR %s='Administrator') ORDER BY q.position LIMIT 6", (user["id"],user["role"])).fetchall()
             if not pinned:
                 pinned = con.execute("SELECT * FROM applications WHERE enabled=1 AND visibility='everyone' ORDER BY built_in DESC,name LIMIT 3").fetchall()
+        is_demo = (user.get("role") == "Demo") if user else False
         admin_nav = ""
         if user["role"] == "Administrator":
             admin_nav = f'<div class="nav-label">Administration</div><a class="{"active" if active=="admin-apps" else ""}" href="/admin-apps">{nav_icon("admin")}<span>Admin applications</span></a><a class="{"active" if active=="admin" else ""}" href="/admin">{nav_icon("settings")}<span>App settings</span></a>'
-        side_apps = "".join(f'<a {get_launch_attrs(a)}>{product_icon(a,True)}<span>{esc(a["name"])}</span></a>' for a in pinned)
+        elif is_demo:
+            admin_nav = f'<div class="nav-label">Administration</div><a class="demo-faded-nav" href="javascript:void(0)" onclick="openDemoModal(event, \'Admin Applications\')" title="Locked in Pilot demo">{nav_icon("admin")}<span>Admin applications</span><span class="demo-tag">Locked</span></a><a class="demo-faded-nav" href="javascript:void(0)" onclick="openDemoModal(event, \'App Settings\')" title="Locked in Pilot demo">{nav_icon("settings")}<span>App settings</span><span class="demo-tag">Locked</span></a>'
+        side_apps = "".join(f'<a {get_launch_attrs(a, is_demo)}>{product_icon(a,True)}<span>{esc(a["name"])}</span></a>' for a in pinned)
         initials = "".join(part[0] for part in user["name"].split()[:2]).upper()
         add = f'<a class="btn" href="/admin">{nav_icon("plus")}Add app</a>' if user["role"] == "Administrator" else ""
         modal_html = '<div id="app-details-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-app-name" aria-hidden="true"><div class="modal-card premium-modal" tabindex="-1"><div class="premium-modal-bg" aria-hidden="true"></div><div class="modal-header"><div id="modal-app-icon" aria-hidden="true"></div><h2 id="modal-app-name"></h2></div><div class="modal-body"><p id="modal-app-desc"></p><div class="modal-meta"><div class="meta-item"><strong>Category</strong><span id="modal-app-cat"></span></div><div class="meta-item"><strong>Version</strong><span id="modal-app-version"></span></div><div class="meta-item"><strong>Publisher</strong><span id="modal-app-pub"></span></div></div></div><div class="modal-actions"><a id="modal-launch-btn" class="btn launch-btn" href="#">Open application</a><button class="btn secondary cancel-btn" data-close="app-details-modal" aria-label="Cancel">Cancel</button></div></div></div>'
-        return head + f'<div class="shell"><aside class="sidebar"><div class="brand"><img class="brandmark" src="/logo.png" alt="VTAB 365"><div><strong>Vtab 365</strong><small>Office workspace</small></div></div><nav class="nav"><div class="nav-label">Workspace</div><a class="{"active" if active=="home" else ""}" href="/">{nav_icon("home")}<span>Home</span></a><a class="{"active" if active=="apps" else ""}" href="/apps">{nav_icon("apps")}<span>All applications</span></a><a class="{"active" if active=="updates" else ""}" href="/updates">{nav_icon("news")}<span>What\'s new</span></a><a class="{"active" if active=="sso" else ""}" href="/sso">{nav_icon("shield")}<span>Security &amp; SSO</span></a>{admin_nav}<div class="sidebar-section-head"><div class="nav-label">Quick access</div><a class="quick-settings" href="/quick-access">Customize</a></div><div class="sidebar-apps">{side_apps}</div></nav><div class="side-user"><div class="avatar">{esc(initials)}</div><div class="user-copy"><strong>{esc(user["name"])}</strong><small>{esc(user["role"])}</small><small>{esc(user["email"])}</small></div></div></aside><section class="main"><header class="topbar"><div class="top-search">{nav_icon("search")}<input id="app-search" class="search" placeholder="Search applications"></div><div class="actions">{add}<div class="top-avatar">{esc(initials[:1])}</div><form method="post" action="/logout"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><button class="btn secondary icon-btn" title="Sign out" aria-label="Sign out">{nav_icon("logout")}</button></form></div></header><main class="content">{flashes}{content}</main></section></div>{modal_html}<script src="/assets/app.js?v=4"></script></body></html>'
+        demo_modal_html = '<div id="demo-version-modal" class="modal demo-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="demo-modal-title" aria-hidden="true"><div class="demo-modal-box" tabindex="-1"><div class="demo-badge-wrap"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></div><h2 id="demo-modal-title" style="margin:0 0 10px;font-size:20px;">Demo Version Preview</h2><p style="margin:0 0 14px;color:var(--muted);font-size:13px;line-height:1.6;">You are exploring the live pilot preview of <strong>VTAB Office Suite 365</strong>. Direct access and live integration for <strong id="demo-modal-app-name" style="color:var(--text);">this application</strong> are available in the enterprise edition.</p><div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:20px;text-align:left;font-size:12px;color:#475569;line-height:1.6;"><strong style="display:block;margin-bottom:4px;color:#1e293b;">⚡ Enterprise Edition Features:</strong>&bull; Single Sign-On (SSO) with your corporate identity<br>&bull; Custom role-based access &amp; governance policies<br>&bull; Full application configuration &amp; audit tracking</div><div style="display:flex;gap:10px;justify-content:center;"><a class="btn" href="https://www.vtabsquare.com/?demo=1&amp;product=vtab-office-suite-365&amp;source=vtab365-pilot" target="_blank" rel="noopener noreferrer">Contact for Full Access ↗</a><button class="btn secondary" onclick="closeDemoModal()">Close</button></div></div></div>'
+        demo_banner = '<div class="demo-banner"><div><strong>🚀 Pilot Preview:</strong> You are exploring the live demo of VTAB Office Suite 365. Application launches and settings are locked in this preview.</div><a class="btn compact-btn" href="https://www.vtabsquare.com/?demo=1&amp;product=vtab-office-suite-365&amp;source=vtab365-pilot-top" target="_blank" rel="noopener noreferrer">Contact for More ↗</a></div>' if is_demo else ""
+        return head + f'<div class="shell"><aside class="sidebar"><div class="brand"><img class="brandmark" src="/logo.png" alt="VTAB 365"><div><strong>Vtab 365</strong><small>Office workspace</small></div></div><nav class="nav"><div class="nav-label">Workspace</div><a class="{"active" if active=="home" else ""}" href="/">{nav_icon("home")}<span>Home</span></a><a class="{"active" if active=="apps" else ""}" href="/apps">{nav_icon("apps")}<span>All applications</span></a><a class="{"active" if active=="updates" else ""}" href="/updates">{nav_icon("news")}<span>What\'s new</span></a><a class="{"active" if active=="sso" else ""}" href="/sso">{nav_icon("shield")}<span>Security &amp; SSO</span></a>{admin_nav}<div class="sidebar-section-head"><div class="nav-label">Quick access</div><a class="quick-settings" href="/quick-access">Customize</a></div><div class="sidebar-apps">{side_apps}</div></nav><div class="side-user"><div class="avatar">{esc(initials)}</div><div class="user-copy"><strong>{esc(user["name"])}</strong><small>{esc(user["role"])}</small><small>{esc(user["email"])}</small></div></div></aside><section class="main"><header class="topbar"><div class="top-search">{nav_icon("search")}<input id="app-search" class="search" placeholder="Search applications"></div><div class="actions">{add}<div class="top-avatar">{esc(initials[:1])}</div><form method="post" action="/logout"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><button class="btn secondary icon-btn" title="Sign out" aria-label="Sign out">{nav_icon("logout")}</button></form></div></header><main class="content">{flashes}{demo_banner}{content}</main></section></div>{modal_html}{demo_modal_html}<script src="/assets/app.js?v=5"></script></body></html>'
 
     def login_page(self, query: dict[str, list[str]]) -> str:
         error = f'<div class="flash error">{esc(query["error"][0])}</div>' if query.get("error") else ""
@@ -484,20 +540,22 @@ class VtabHandler(BaseHTTPRequestHandler):
             pinned = con.execute("SELECT a.* FROM user_quick_access q JOIN applications a ON a.id=q.app_id WHERE q.user_id=%s AND a.enabled=1 AND (a.visibility='everyone' OR %s='Administrator') ORDER BY q.position LIMIT 6", (user["id"],user["role"])).fetchall() or apps[:4]
         categories = sorted({a["category"] for a in apps})
         chips = '<button class="chip active" data-cat="all">All</button>' + "".join(f'<button class="chip" data-cat="{esc(c)}">{esc(c.title())}</button>' for c in categories)
-        quick = "".join(f'<a class="quick-access-tile" {get_launch_attrs(a)}>{product_icon(a,True)}<span>{esc(a["name"])}</span></a>' for a in pinned)
+        is_demo = user.get("role") == "Demo"
+        quick = "".join(f'<a class="quick-access-tile" {get_launch_attrs(a, is_demo)}>{product_icon(a,True)}<span>{esc(a["name"])}</span></a>' for a in pinned)
         release_html = ""
         for item in releases:
             highlights = "".join(f'<span>{esc(x.strip())}</span>' for x in item["highlights"].split("|")[:3] if x.strip())
             cls = item["status"].lower().replace(" ","-")
             release_html += f'<article class="home-release-card"><div class="home-release-top"><span class="release-status {esc(cls)}">{esc(item["status"])}</span><span class="release-date">{esc(item["release_date"] or item["version"])}</span></div><h3>{esc(item["title"])}</h3><p>{esc(item["description"])}</p><div class="home-release-highlights">{highlights}</div><div class="home-release-footer"><div class="home-release-product"><strong>{esc(item["app_name"])}</strong><small>{esc(item["version"])}</small></div><a class="home-release-link" href="/updates#release-{item["id"]}">View release details →</a></div></article>'
         admin = f'<div class="intro-actions"><a class="btn secondary" href="/admin-apps">Admin applications</a><a class="btn" href="/admin">{nav_icon("plus")}Add application</a></div>' if user["role"] == "Administrator" else ""
-        content = f'<section class="page-intro"><div><div class="eyebrow">Vtab Office Suite</div><h1>Your applications</h1><p>Everything you need to work, in one simple and secure workspace.</p></div>{admin}</section><section class="panel quick-access-panel"><div class="quick-access-head"><div><h2>Quick access</h2><p>Your chosen tools, ready to launch with your Vtab account.</p></div><a class="btn secondary" href="/quick-access">Customize</a></div><div class="quick-access-grid">{quick}</div></section><div class="section-head" id="apps"><div><h2>All applications</h2><p>Tools available to everyone in the workspace.</p></div><a class="section-link" href="/apps">Open full launcher →</a></div><div class="filters">{chips}</div><div class="grid">{"".join(application_card(a) for a in apps)}</div><div class="section-head"><div><h2>What\'s new and upcoming</h2><p>Latest workspace releases and applications planned for your team.</p></div><a class="section-link" href="/updates">View all releases →</a></div><div class="home-release-grid">{release_html}</div>'
+        content = f'<section class="page-intro"><div><div class="eyebrow">Vtab Office Suite</div><h1>Your applications</h1><p>Everything you need to work, in one simple and secure workspace.</p></div>{admin}</section><section class="panel quick-access-panel"><div class="quick-access-head"><div><h2>Quick access</h2><p>Your chosen tools, ready to launch with your Vtab account.</p></div><a class="btn secondary" href="/quick-access">Customize</a></div><div class="quick-access-grid">{quick}</div></section><div class="section-head" id="apps"><div><h2>All applications</h2><p>Tools available to everyone in the workspace.</p></div><a class="section-link" href="/apps">Open full launcher →</a></div><div class="filters">{chips}</div><div class="grid">{"".join(application_card(a, is_demo=is_demo) for a in apps)}</div><div class="section-head"><div><h2>What\'s new and upcoming</h2><p>Latest workspace releases and applications planned for your team.</p></div><a class="section-link" href="/updates">View all releases →</a></div><div class="home-release-grid">{release_html}</div>'
         return self.layout("Workspace",content,user,session,"home",query)
 
     def apps_page(self,user,session,query):
         with db() as con: apps=con.execute("SELECT * FROM applications WHERE enabled=1 AND (visibility='everyone' OR (visibility='admins' AND %s='Administrator')) ORDER BY built_in DESC,name", (user["role"],)).fetchall()
+        is_demo = user.get("role") == "Demo"
         cats=sorted({a["category"] for a in apps}); chips='<button class="chip active" data-cat="all">All</button>'+"".join(f'<button class="chip" data-cat="{esc(c)}">{esc(c.title())}</button>' for c in cats)
-        return self.layout("All applications",f'<section class="page-intro"><div><div class="eyebrow">Application launcher</div><h1>All applications</h1><p>Browse every tool available to your workspace account.</p></div><a class="btn secondary page-home" href="/">{nav_icon("home")}Home</a></section><div class="filters">{chips}</div><div class="grid">{"".join(application_card(a) for a in apps)}</div>',user,session,"apps",query)
+        return self.layout("All applications",f'<section class="page-intro"><div><div class="eyebrow">Application launcher</div><h1>All applications</h1><p>Browse every tool available to your workspace account.</p></div><a class="btn secondary page-home" href="/">{nav_icon("home")}Home</a></section><div class="filters">{chips}</div><div class="grid">{"".join(application_card(a, is_demo=is_demo) for a in apps)}</div>',user,session,"apps",query)
 
     def updates_page(self,user,session,query):
         with db() as con: items=con.execute("SELECT * FROM announcements ORDER BY CASE WHEN status='Live Now' THEN 1 ELSE 0 END,id DESC").fetchall()
@@ -582,11 +640,19 @@ class VtabHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path,query=self.route()
+        if path=="/api/auth/verify": return self.verify_identity()
         if path=="/assets/style.css": return self.send_bytes((BASE_DIR/"style.css").read_bytes(),content_type="text/css; charset=utf-8")
         if path=="/assets/app.js": return self.send_bytes((BASE_DIR/"app.js").read_bytes(),content_type="application/javascript; charset=utf-8")
         if path=="/logo.png": return self.send_bytes((BASE_DIR/"public"/"logo.png").read_bytes(), content_type="image/png")
         if path=="/favicon.ico": return self.send_bytes((BASE_DIR/"public"/"logo.png").read_bytes(), content_type="image/png")
         if path=="/health": return self.text(json.dumps({"status":"ok","python":"source-runtime","database":"supabase-postgresql"}),content_type="application/json")
+        if path=="/demo":
+            with db() as con:
+                demo_user = con.execute("SELECT * FROM users WHERE email='demo@vtaboffice365.com' AND active=1").fetchone()
+                if not demo_user:
+                    demo_user = con.execute("INSERT INTO users(name,email,password_hash,role,department,employee_id,registered_at,active) VALUES(%s,%s,%s,%s,%s,%s,%s,1) RETURNING *",
+                        ("VTAB Pilot User", "demo@vtaboffice365.com", password_hash("Demo@123"), "Demo", "Pilot Workspace", "PILOT-001", "2026-11-03")).fetchone()
+            return self.redirect("/", self.new_session(demo_user["id"]))
         if path=="/login":
             user,_=self.current_session(); return self.redirect("/") if user else self.text(self.login_page(query))
         if path=="/verify-otp":
@@ -619,6 +685,15 @@ class VtabHandler(BaseHTTPRequestHandler):
             with db() as con:
                 app_record = con.execute("SELECT * FROM applications WHERE slug=%s AND enabled=1", (app_slug,)).fetchone()
             if not app_record: return self.text(self.layout("SSO Error", "<div class='panel'><h2>Application not found or disabled</h2></div>", user, session), 404)
+            if app_record["visibility"] == "admins" and user["role"] != "Administrator":
+                return self.text("Forbidden", 403)
+            target = urllib.parse.urlsplit(app_record["url"])
+            if app_record["sso_mode"] == "shared_session":
+                if target.scheme != "https" or not production_host(target.netloc) or target.username or target.password:
+                    return self.text("Shared sign-in requires an HTTPS vtabsquare.com application URL", 400)
+                if not verify_vtab_token(read_cookie(self.headers.get("Cookie", ""), IDENTITY_COOKIE), SECRET_KEY):
+                    return self.flash("/login", "Please sign out and sign in with email verification to enable shared sign-in.", True)
+                return self.redirect(app_record["url"])
             sso_secret = os.getenv("VTAB_SSO_SECRET")
             if not sso_secret: return self.text(self.layout("SSO Error", "<div class='panel'><h2>SSO not configured (missing secret)</h2></div>", user, session), 500)
             
@@ -657,14 +732,16 @@ class VtabHandler(BaseHTTPRequestHandler):
             with db() as con: user=con.execute("SELECT * FROM users WHERE email=%s AND active=1",(login_email,)).fetchone()
             if not user or not password_ok(login_password,user["password_hash"]): 
                 self.audit("LOGIN",form.get("email","anonymous"),"Invalid credentials.",status="FAILED"); return self.flash("/login","Invalid email or password.",True)
-            import random
-            otp = str(random.randint(100000, 999999))
+            if user["role"] == "Demo":
+                self.audit("LOGIN", user["email"], "Pilot Demo session created.")
+                return self.redirect("/", self.new_session(user["id"]))
+            otp = str(secrets.randbelow(900000) + 100000)
             with db() as con: con.execute("INSERT INTO login_otps (email, otp_code) VALUES (%s, %s)", (user["email"], otp))
             send_email_otp(user["email"], otp)
             self.send_response(303)
             self.send_header("Location", "/verify-otp")
             import urllib.parse
-            self.send_header("Set-Cookie", f"vtab_pending_email={urllib.parse.quote(user['email'])}; Path=/; HttpOnly; Max-Age=300")
+            self.send_header("Set-Cookie", cookie_header("vtab_pending_email", urllib.parse.quote(user["email"]), self.headers.get("Host", ""), max_age=300, shared=False))
             self.end_headers()
             return
         if path=="/verify-otp":
@@ -683,8 +760,9 @@ class VtabHandler(BaseHTTPRequestHandler):
                     return self.flash("/verify-otp", "Invalid or expired verification code.", True)
                 con.execute("DELETE FROM login_otps WHERE email=%s", (pending_email,))
                 user = con.execute("SELECT * FROM users WHERE email=%s AND active=1", (pending_email,)).fetchone()
+            if not user: return self.flash("/login", "Account is unavailable.", True)
             self.audit("LOGIN",user["email"],"Workspace session created.")
-            return self.redirect("/",self.new_session(user["id"]))
+            return self.redirect("/",self.new_session(user["id"], federated=True))
         if path=="/register":
             name,email,password=form.get("name","").strip(),form.get("email","").strip().lower(),form.get("password","")
             if not name or "@" not in email or len(password)<8: return self.flash("/register","Enter valid registration details.",True)
@@ -697,8 +775,7 @@ class VtabHandler(BaseHTTPRequestHandler):
             email = form.get("email", "").strip().lower()
             with db() as con: user = con.execute("SELECT * FROM users WHERE email=%s AND active=1", (email,)).fetchone()
             if user:
-                import random
-                otp = str(random.randint(100000, 999999))
+                otp = str(secrets.randbelow(900000) + 100000)
                 with db() as con: con.execute("INSERT INTO login_otps (email, otp_code) VALUES (%s, %s)", (user["email"], otp))
                 send_email_otp(user["email"], otp)
             import urllib.parse
@@ -713,14 +790,17 @@ class VtabHandler(BaseHTTPRequestHandler):
                 con.execute("DELETE FROM login_otps WHERE email=%s", (email,))
                 con.execute("UPDATE users SET password_hash=%s WHERE email=%s", (password_hash(new_password), email))
                 user = con.execute("SELECT * FROM users WHERE email=%s AND active=1", (email,)).fetchone()
+                if user:
+                    con.execute("DELETE FROM sessions WHERE user_id=%s", (user["id"],))
+            if not user: return self.flash("/login", "Account is unavailable.", True)
             self.audit("PASSWORD_RESET", user["email"], "User reset their password via OTP.")
-            return self.redirect("/", self.new_session(user["id"]))
+            return self.redirect("/", self.new_session(user["id"], federated=True))
         user,session=self.require_user()
         if not user: return
         if not self.check_csrf(form,session): return self.text(self.layout("Invalid request",'<div class="panel"><h2>Security check failed</h2></div>',user,session),403)
         if path=="/logout":
             with db() as con: con.execute("DELETE FROM sessions WHERE id=%s",(session["id"],))
-            return self.redirect("/login",f"{COOKIE_NAME}=; Path=/; Max-Age=0")
+            return self.redirect("/login", self.clear_auth_cookies())
         if path=="/quick-access/save":
             ids=[int(k[4:]) for k in form if k.startswith("app_") and k[4:].isdigit()][:6]
             with db() as con:
@@ -815,6 +895,8 @@ class VtabHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if os.environ.get("VTAB_ENV") == "production":
+        require_secret(SECRET_KEY)
     if False:
         raise RuntimeError("DATABASE_URL environment variable is not set. "
                            "Get the connection string from Supabase Dashboard → "
