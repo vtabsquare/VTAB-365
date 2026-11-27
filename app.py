@@ -17,6 +17,8 @@ import os
 from pathlib import Path
 import sqlite3
 import secrets
+import threading
+import time
 from typing import Any
 import urllib.parse
 import logging
@@ -50,13 +52,41 @@ def now_iso() -> str:
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
+
+_DB_POOL: ThreadedConnectionPool | None = None
+_DB_POOL_LOCK = threading.Lock()
+
+
+def _get_pool() -> ThreadedConnectionPool:
+    global _DB_POOL
+    if _DB_POOL is None:
+        with _DB_POOL_LOCK:
+            if _DB_POOL is None:
+                db_url = os.environ.get("DATABASE_URL")
+                if not db_url:
+                    raise ValueError("DATABASE_URL must be set")
+                _DB_POOL = ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=10,
+                    dsn=db_url,
+                    cursor_factory=RealDictCursor,
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=5,
+                )
+    return _DB_POOL
+
 
 @contextmanager
 def db():
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise ValueError("DATABASE_URL must be set")
-    conn = psycopg2.connect(db_url, cursor_factory=RealDictCursor)
+    pool = _get_pool()
+    conn = pool.getconn()
+    if conn.closed:
+        pool.putconn(conn, close=True)
+        conn = pool.getconn()
+    discard = False
     try:
         # We return conn directly since psycopg2 cursor behaves similarly
         # but we need to patch execute and executemany on the connection
@@ -74,11 +104,80 @@ def db():
                 return cur
         yield _PgCon(conn)
         conn.commit()
+    except (psycopg2.InterfaceError, psycopg2.OperationalError):
+        discard = True
+        raise
     except Exception:
-        conn.rollback()
+        if not conn.closed:
+            conn.rollback()
         raise
     finally:
-        conn.close()
+        pool.putconn(conn, close=discard or bool(conn.closed))
+
+
+# ---------------------------------------------------------------------------
+# Short-lived thread-safe in-memory cache for read-heavy workspace data
+# ---------------------------------------------------------------------------
+
+_CACHE: dict[str, tuple[float, Any]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def cache_get(key: str, ttl: float = 60.0) -> Any:
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        entry = _CACHE.get(key)
+        if entry and (now - entry[0]) < ttl:
+            return entry[1]
+    return None
+
+
+def cache_set(key: str, value: Any) -> Any:
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.monotonic(), value)
+    return value
+
+
+def cache_invalidate(prefix: str | None = None) -> None:
+    with _CACHE_LOCK:
+        if prefix is None:
+            _CACHE.clear()
+        else:
+            for k in [k for k in _CACHE if k.startswith(prefix)]:
+                _CACHE.pop(k, None)
+
+
+def get_cached_apps() -> list[dict]:
+    cached = cache_get("apps:all", ttl=60.0)
+    if cached is not None:
+        return cached
+    with db() as con:
+        rows = [dict(r) for r in con.execute("SELECT * FROM applications ORDER BY built_in DESC,name").fetchall()]
+    return cache_set("apps:all", rows)
+
+
+def get_cached_announcements() -> list[dict]:
+    cached = cache_get("announcements:all", ttl=60.0)
+    if cached is not None:
+        return cached
+    with db() as con:
+        rows = [dict(r) for r in con.execute("SELECT * FROM announcements ORDER BY CASE WHEN status='Live Now' THEN 1 ELSE 0 END,id DESC").fetchall()]
+    return cache_set("announcements:all", rows)
+
+
+def get_cached_pinned(user_id: int, role: str) -> list[dict]:
+    key = f"pinned:{user_id}:{role}"
+    cached = cache_get(key, ttl=30.0)
+    if cached is not None:
+        return cached
+    with db() as con:
+        pinned = [dict(r) for r in con.execute(
+            "SELECT a.* FROM user_quick_access q JOIN applications a ON a.id=q.app_id WHERE q.user_id=%s AND a.enabled=1 AND (a.visibility='everyone' OR %s='Administrator') ORDER BY q.position LIMIT 6",
+            (user_id, role),
+        ).fetchall()]
+    if not pinned:
+        pinned = [a for a in get_cached_apps() if a["enabled"] == 1 and a["visibility"] == "everyone"][:3]
+    return cache_set(key, pinned)
 
 
 # ---------------------------------------------------------------------------
@@ -475,10 +574,20 @@ class VtabHandler(BaseHTTPRequestHandler):
             expected = hmac.new(SECRET_KEY, sid.encode(), hashlib.sha256).hexdigest()
             if not hmac.compare_digest(supplied, expected):
                 return None, None
+            cached = cache_get(f"session:{sid}", ttl=15.0)
+            if cached is not None:
+                c_user, c_session = cached
+                if c_session and c_session.get("expires_at", "") > now_iso():
+                    return c_user, c_session
+                cache_invalidate(f"session:{sid}")
             with db() as con:
                 session = con.execute("SELECT * FROM sessions WHERE id=%s AND expires_at>%s", (sid,now_iso())).fetchone()
                 user = con.execute("SELECT * FROM users WHERE id=%s AND active=1", (session["user_id"],)).fetchone() if session else None
-            return user, session
+            if user and session:
+                u_dict, s_dict = dict(user), dict(session)
+                cache_set(f"session:{sid}", (u_dict, s_dict))
+                return u_dict, s_dict
+            return None, None
         except (ValueError, KeyError, cookies.CookieError):
             return None, None
 
@@ -504,11 +613,8 @@ class VtabHandler(BaseHTTPRequestHandler):
             flashes += f'<div class="flash error">{esc(query["error"][0])}</div>'
         head = f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} &middot; Vtab 365</title><link rel="icon" type="image/png" href="/favicon.ico"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css"><link rel="stylesheet" href="/assets/style.css?v=6"></head><body>'
         if not user:
-            return head + content + '<script src="/assets/app.js"></script></body></html>'
-        with db() as con:
-            pinned = con.execute("SELECT a.* FROM user_quick_access q JOIN applications a ON a.id=q.app_id WHERE q.user_id=%s AND a.enabled=1 AND (a.visibility='everyone' OR %s='Administrator') ORDER BY q.position LIMIT 6", (user["id"],user["role"])).fetchall()
-            if not pinned:
-                pinned = con.execute("SELECT * FROM applications WHERE enabled=1 AND visibility='everyone' ORDER BY built_in DESC,name LIMIT 3").fetchall()
+            return head + content + '<script src="/assets/app.js?v=6"></script></body></html>'
+        pinned = get_cached_pinned(user["id"], user["role"])
         is_demo = (user.get("role") == "Demo") if user else False
         home_url = "/demo" if is_demo else "/"
         apps_url = "/demo?view=apps" if is_demo else "/apps"
@@ -527,7 +633,7 @@ class VtabHandler(BaseHTTPRequestHandler):
         modal_html = '<div id="app-details-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-app-name" aria-hidden="true"><div class="modal-card premium-modal" tabindex="-1"><div class="premium-modal-bg" aria-hidden="true"></div><div class="modal-header"><div id="modal-app-icon" aria-hidden="true"></div><h2 id="modal-app-name"></h2></div><div class="modal-body"><p id="modal-app-desc"></p><div class="modal-meta"><div class="meta-item"><strong>Category</strong><span id="modal-app-cat"></span></div><div class="meta-item"><strong>Version</strong><span id="modal-app-version"></span></div><div class="meta-item"><strong>Publisher</strong><span id="modal-app-pub"></span></div></div></div><div class="modal-actions"><a id="modal-launch-btn" class="btn launch-btn" href="#">Open application</a><button class="btn secondary cancel-btn" data-close="app-details-modal" aria-label="Cancel">Cancel</button></div></div></div>'
         demo_modal_html = '<div id="demo-version-modal" class="modal demo-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="demo-modal-title" aria-hidden="true"><div class="demo-modal-box" tabindex="-1"><div class="demo-badge-wrap"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></div><h2 id="demo-modal-title" style="margin:0 0 10px;font-size:20px;">Demo Version Preview</h2><p style="margin:0 0 14px;color:var(--muted);font-size:13px;line-height:1.6;">You are exploring the live pilot preview of <strong>VTAB Office Suite 365</strong>. Direct access and live integration for <strong id="demo-modal-app-name" style="color:var(--text);">this application</strong> are available in the enterprise edition.</p><div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:20px;text-align:left;font-size:12px;color:#475569;line-height:1.6;"><strong style="display:block;margin-bottom:4px;color:#1e293b;">⚡ Enterprise Edition Features:</strong>&bull; Single Sign-On (SSO) with your corporate identity<br>&bull; Custom role-based access &amp; governance policies<br>&bull; Full application configuration &amp; audit tracking</div><div style="display:flex;gap:10px;justify-content:center;"><a class="btn" href="https://www.vtabsquare.com/?demo=1&amp;product=vtab-office-suite-365&amp;source=vtab365-pilot" target="_blank" rel="noopener noreferrer">Contact for Full Access ↗</a><button class="btn secondary" onclick="closeDemoModal()">Close</button></div></div></div>'
         demo_banner = '<div class="demo-banner"><div><strong>🚀 Pilot Preview:</strong> You are exploring the live demo of VTAB Office Suite 365. Application launches and settings are locked in this preview.</div><a class="btn compact-btn" href="https://www.vtabsquare.com/?demo=1&amp;product=vtab-office-suite-365&amp;source=vtab365-pilot-top" target="_blank" rel="noopener noreferrer">Contact for More ↗</a></div>' if is_demo else ""
-        return head + f'<div class="shell"><aside class="sidebar"><div class="brand"><img class="brandmark" src="/logo.png" alt="VTAB 365"><div><strong>Vtab 365</strong><small>Office workspace</small></div></div><nav class="nav"><div class="nav-label">Workspace</div><a class="{"active" if active=="home" else ""}" href="{home_url}">{nav_icon("home")}<span>Home</span></a><a class="{"active" if active=="apps" else ""}" href="{apps_url}">{nav_icon("apps")}<span>All applications</span></a><a class="{"active" if active=="updates" else ""}" href="{updates_url}">{nav_icon("news")}<span>What\'s new</span></a><a class="{"active" if active=="sso" else ""}" href="{sso_url}">{nav_icon("shield")}<span>Security &amp; SSO</span></a>{admin_nav}<div class="sidebar-section-head"><div class="nav-label">Quick access</div><a class="quick-settings" {quick_settings_attrs}>Customize</a></div><div class="sidebar-apps">{side_apps}</div></nav><div class="side-user"><div class="avatar">{esc(initials)}</div><div class="user-copy"><strong>{esc(user["name"])}</strong><small>{esc(user["role"])}</small><small>{esc(user["email"])}</small></div></div></aside><section class="main"><header class="topbar"><div class="top-search">{nav_icon("search")}<input id="app-search" class="search" placeholder="Search applications"></div><div class="actions">{add}<div class="top-avatar">{esc(initials[:1])}</div>{logout_btn}</div></header><main class="content">{flashes}{demo_banner}{content}</main></section></div>{modal_html}{demo_modal_html}<script src="/assets/app.js?v=5"></script></body></html>'
+        return head + f'<div class="shell"><aside class="sidebar"><div class="brand"><img class="brandmark" src="/logo.png" alt="VTAB 365"><div><strong>Vtab 365</strong><small>Office workspace</small></div></div><nav class="nav"><div class="nav-label">Workspace</div><a class="{"active" if active=="home" else ""}" href="{home_url}">{nav_icon("home")}<span>Home</span></a><a class="{"active" if active=="apps" else ""}" href="{apps_url}">{nav_icon("apps")}<span>All applications</span></a><a class="{"active" if active=="updates" else ""}" href="{updates_url}">{nav_icon("news")}<span>What\'s new</span></a><a class="{"active" if active=="sso" else ""}" href="{sso_url}">{nav_icon("shield")}<span>Security &amp; SSO</span></a>{admin_nav}<div class="sidebar-section-head"><div class="nav-label">Quick access</div><a class="quick-settings" {quick_settings_attrs}>Customize</a></div><div class="sidebar-apps">{side_apps}</div></nav><div class="side-user"><div class="avatar">{esc(initials)}</div><div class="user-copy"><strong>{esc(user["name"])}</strong><small>{esc(user["role"])}</small><small>{esc(user["email"])}</small></div></div></aside><section class="main"><header class="topbar"><div class="top-search">{nav_icon("search")}<input id="app-search" class="search" placeholder="Search applications"></div><div class="actions">{add}<div class="top-avatar">{esc(initials[:1])}</div>{logout_btn}</div></header><main class="content">{flashes}{demo_banner}{content}</main></section></div>{modal_html}{demo_modal_html}<script src="/assets/app.js?v=6"></script></body></html>'
 
     def login_page(self, query: dict[str, list[str]]) -> str:
         error = f'<div class="flash error">{esc(query["error"][0])}</div>' if query.get("error") else ""
@@ -540,10 +646,10 @@ class VtabHandler(BaseHTTPRequestHandler):
         return self.layout("Verify OTP", content)
 
     def dashboard(self, user: dict, session: dict, query: dict[str,list[str]]) -> str:
-        with db() as con:
-            apps = con.execute("SELECT * FROM applications WHERE enabled=1 AND (visibility='everyone' OR (visibility='admins' AND %s='Administrator')) ORDER BY built_in DESC,name", (user["role"],)).fetchall()
-            releases = con.execute("SELECT * FROM announcements ORDER BY CASE WHEN status='Live Now' THEN 1 ELSE 0 END,id DESC LIMIT 6").fetchall()
-            pinned = con.execute("SELECT a.* FROM user_quick_access q JOIN applications a ON a.id=q.app_id WHERE q.user_id=%s AND a.enabled=1 AND (a.visibility='everyone' OR %s='Administrator') ORDER BY q.position LIMIT 6", (user["id"],user["role"])).fetchall() or apps[:4]
+        all_apps = get_cached_apps()
+        apps = [a for a in all_apps if a["enabled"] == 1 and (a["visibility"] == "everyone" or (a["visibility"] == "admins" and user["role"] == "Administrator"))]
+        releases = get_cached_announcements()[:6]
+        pinned = get_cached_pinned(user["id"], user["role"]) or apps[:4]
         categories = sorted({a["category"] for a in apps})
         chips = '<button class="chip active" data-cat="all">All</button>' + "".join(f'<button class="chip" data-cat="{esc(c)}">{esc(c.title())}</button>' for c in categories)
         is_demo = user.get("role") == "Demo"
@@ -561,14 +667,14 @@ class VtabHandler(BaseHTTPRequestHandler):
         return self.layout("Workspace",content,user,session,"home",query)
 
     def apps_page(self,user,session,query):
-        with db() as con: apps=con.execute("SELECT * FROM applications WHERE enabled=1 AND (visibility='everyone' OR (visibility='admins' AND %s='Administrator')) ORDER BY built_in DESC,name", (user["role"],)).fetchall()
+        apps = [a for a in get_cached_apps() if a["enabled"] == 1 and (a["visibility"] == "everyone" or (a["visibility"] == "admins" and user["role"] == "Administrator"))]
         is_demo = user.get("role") == "Demo"
         home_url = "/demo" if is_demo else "/"
         cats=sorted({a["category"] for a in apps}); chips='<button class="chip active" data-cat="all">All</button>'+"".join(f'<button class="chip" data-cat="{esc(c)}">{esc(c.title())}</button>' for c in cats)
         return self.layout("All applications",f'<section class="page-intro"><div><div class="eyebrow">Application launcher</div><h1>All applications</h1><p>Browse every tool available to your workspace account.</p></div><a class="btn secondary page-home" href="{home_url}">{nav_icon("home")}Home</a></section><div class="filters">{chips}</div><div class="grid">{"".join(application_card(a, is_demo=is_demo) for a in apps)}</div>',user,session,"apps",query)
 
     def updates_page(self,user,session,query):
-        with db() as con: items=con.execute("SELECT * FROM announcements ORDER BY CASE WHEN status='Live Now' THEN 1 ELSE 0 END,id DESC").fetchall()
+        items = get_cached_announcements()
         is_demo = user.get("role") == "Demo"
         home_url = "/demo" if is_demo else "/"
         timeline=""
@@ -578,21 +684,21 @@ class VtabHandler(BaseHTTPRequestHandler):
         return self.layout("What's new",f'<section class="page-intro"><div><div class="eyebrow">Release centre</div><h1>What\'s new and upcoming</h1><p>Follow live improvements and applications planned for your workspace.</p></div><a class="btn secondary page-home" href="{home_url}">{nav_icon("home")}Home</a></section><div class="timeline">{timeline}</div>',user,session,"updates",query)
 
     def quick_page(self,user,session,query):
+        apps = sorted([a for a in get_cached_apps() if a["enabled"] == 1 and (a["visibility"] == "everyone" or user["role"] == "Administrator")], key=lambda x: (x["visibility"], -x["built_in"], x["name"]))
         with db() as con:
-            apps=con.execute("SELECT * FROM applications WHERE enabled=1 AND (visibility='everyone' OR %s='Administrator') ORDER BY visibility,built_in DESC,name",(user["role"],)).fetchall()
             selected={r["app_id"] for r in con.execute("SELECT app_id FROM user_quick_access WHERE user_id=%s",(user["id"],)).fetchall()}
         choices="".join(f'<label class="quick-choice"><input type="checkbox" name="app_{a["id"]}" {"checked" if a["id"] in selected else ""}>{product_icon(a,True)}<span class="quick-choice-copy"><strong>{esc(a["name"])}</strong><small>{esc(a["category"].title())}{" · Admin only" if a["visibility"]=="admins" else ""}</small></span></label>' for a in apps)
         return self.layout("Customize Quick Access",f'<section class="page-intro"><div><div class="eyebrow">Personal workspace</div><h1>Customize Quick Access</h1><p>Choose up to six applications for Home and the sidebar.</p></div><a class="btn secondary page-home" href="/">{nav_icon("home")}Home</a></section><form class="panel" method="post" action="/quick-access/save"><input type="hidden" name="csrf" value="{esc(session["csrf_token"])}"><div class="quick-picker">{choices}</div><button class="btn">Save Quick Access</button></form>',user,session,"quick",query)
 
     def sso_page(self,user,session,query):
-        with db() as con: apps=con.execute("SELECT * FROM applications WHERE enabled=1 AND (visibility='everyone' OR %s='Administrator') ORDER BY name",(user["role"],)).fetchall()
+        apps = sorted([a for a in get_cached_apps() if a["enabled"] == 1 and (a["visibility"] == "everyone" or user["role"] == "Administrator")], key=lambda x: x["name"])
         is_demo = user.get("role") == "Demo"
         home_url = "/demo" if is_demo else "/"
         rows="".join(f'<tr><td><div class="manage-app">{product_icon(a,True)}<strong>{esc(a["name"])}</strong></div></td><td>{esc(a["sso_mode"].upper())}</td><td><span class="status">Connected</span></td></tr>' for a in apps)
         return self.layout("Security & SSO",f'<section class="page-intro"><div><div class="eyebrow">Identity</div><h1>Security &amp; SSO</h1><p>Your Vtab identity securely connects permitted applications.</p></div><a class="btn secondary page-home" href="{home_url}">{nav_icon("home")}Home</a></section><div class="panel table-wrap"><table><thead><tr><th>Application</th><th>Protocol</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table></div>',user,session,"sso",query)
 
     def admin_apps_page(self,user,session,query):
-        with db() as con: apps=con.execute("SELECT * FROM applications WHERE enabled=1 AND visibility='admins' ORDER BY name").fetchall()
+        apps = sorted([a for a in get_cached_apps() if a["enabled"] == 1 and a["visibility"] == "admins"], key=lambda x: x["name"])
         return self.layout("Admin applications",f'<section class="panel admin-hero admin-app-banner"><div><div class="eyebrow">Administration</div><h1>Admin applications</h1><p>Protected operational tools available only to administrator accounts.</p></div><div class="intro-actions"><a class="btn secondary page-home" href="/">{nav_icon("home")}Home</a><a class="btn secondary" href="/admin">Manage settings</a></div></section><div class="grid admin-grid">{"".join(application_card(a,True) for a in apps)}</div>',user,session,"admin-apps",query)
 
     def admin_page(self,user,session,query):
@@ -661,11 +767,14 @@ class VtabHandler(BaseHTTPRequestHandler):
         if path=="/favicon.ico": return self.send_bytes((BASE_DIR/"public"/"logo.png").read_bytes(), content_type="image/png")
         if path=="/health": return self.text(json.dumps({"status":"ok","python":"source-runtime","database":"supabase-postgresql"}),content_type="application/json")
         if path=="/demo" or path=="/embed":
-            with db() as con:
-                demo_user = con.execute("SELECT * FROM users WHERE email='demo@vtaboffice365.com' AND active=1").fetchone()
-                if not demo_user:
-                    demo_user = con.execute("INSERT INTO users(name,email,password_hash,role,department,employee_id,registered_at,active) VALUES(%s,%s,%s,%s,%s,%s,%s,1) RETURNING *",
-                        ("VTAB Pilot User", "demo@vtaboffice365.com", password_hash("Demo@123"), "Demo", "Pilot Workspace", "PILOT-001", "2026-11-03")).fetchone()
+            demo_user = cache_get("demo_user", ttl=60.0)
+            if demo_user is None:
+                with db() as con:
+                    row = con.execute("SELECT * FROM users WHERE email='demo@vtaboffice365.com' AND active=1").fetchone()
+                    if not row:
+                        row = con.execute("INSERT INTO users(name,email,password_hash,role,department,employee_id,registered_at,active) VALUES(%s,%s,%s,%s,%s,%s,%s,1) RETURNING *",
+                            ("VTAB Pilot User", "demo@vtaboffice365.com", password_hash("Demo@123"), "Demo", "Pilot Workspace", "PILOT-001", "2026-11-03")).fetchone()
+                    demo_user = cache_set("demo_user", dict(row))
             session = {"csrf_token": "demo-csrf-token", "id": "demo-session"}
             view = query.get("view", ["home"])[0]
             if view == "apps":
@@ -822,6 +931,7 @@ class VtabHandler(BaseHTTPRequestHandler):
         if not self.check_csrf(form,session): return self.text(self.layout("Invalid request",'<div class="panel"><h2>Security check failed</h2></div>',user,session),403)
         if path=="/logout":
             with db() as con: con.execute("DELETE FROM sessions WHERE id=%s",(session["id"],))
+            cache_invalidate(f"session:{session['id']}")
             return self.redirect("/login", self.clear_auth_cookies())
         if path=="/quick-access/save":
             ids=[int(k[4:]) for k in form if k.startswith("app_") and k[4:].isdigit()][:6]
@@ -829,6 +939,7 @@ class VtabHandler(BaseHTTPRequestHandler):
                 allowed={r["id"] for r in con.execute("SELECT id FROM applications WHERE enabled=1 AND (visibility='everyone' OR %s='Administrator')",(user["role"],)).fetchall()}
                 con.execute("DELETE FROM user_quick_access WHERE user_id=%s",(user["id"],))
                 con.executemany("INSERT INTO user_quick_access(user_id,app_id,position) VALUES(%s,%s,%s)",[(user["id"],i,p) for p,i in enumerate(ids) if i in allowed])
+            cache_invalidate(f"pinned:{user['id']}:")
             return self.flash("/quick-access","Quick Access updated.")
         if path=="/leave":
             start,end=form.get("start_date",""),form.get("end_date","")
@@ -850,6 +961,8 @@ class VtabHandler(BaseHTTPRequestHandler):
             try:
                 with db() as con: con.execute("INSERT INTO applications(slug,name,description,category,icon,color,url,sso_mode,enabled,built_in,allowed_roles,version,publisher,created_at,visibility,logo_url) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,1,0,%s,%s,%s,%s,%s,%s)",(slug,form.get("name","")[:80],form.get("description","")[:400],form.get("category","custom"),form.get("icon","AP")[:3].upper(),color.upper(),form.get("url","")[:500],form.get("sso_mode","oidc"),'["All Employees"]',form.get("version","v1.0.0")[:30],form.get("publisher","Vtab IT")[:100],now_iso(),visibility,logo))
             except sqlite3.IntegrityError: return self.flash("/admin","Application slug already exists.",True)
+            cache_invalidate("apps:")
+            cache_invalidate("pinned:")
             self.audit("APP_CREATED", user["email"], f"Created application {slug}", slug)
             return self.flash("/admin","Application added.")
         if path=="/admin/apps/update":
@@ -866,34 +979,46 @@ class VtabHandler(BaseHTTPRequestHandler):
                 if "unique" in str(e).lower() or isinstance(e, sqlite3.IntegrityError):
                     return self.flash(f"/admin/apps/edit?id={app_id}","Application slug already exists.",True)
                 raise
+            cache_invalidate("apps:")
+            cache_invalidate("pinned:")
             self.audit("APP_UPDATED", user["email"], f"Updated application {slug}", slug)
             return self.flash("/admin?tab=manage","Application updated.")
         if path=="/admin/apps/settings":
             visibility=form.get("visibility","everyone"); visibility=visibility if visibility in {"everyone","admins"} else "everyone"
             with db() as con: con.execute("UPDATE applications SET visibility=%s WHERE id=%s",(visibility,form.get("id")))
+            cache_invalidate("apps:")
+            cache_invalidate("pinned:")
             self.audit("APP_VISIBILITY_CHANGED", user["email"], f"Changed visibility to {visibility}", form.get("id"))
             return self.flash("/admin?tab=manage","Visibility updated.")
         if path=="/admin/users/role":
             role=form.get("role","Employee"); role=role if role in {"Employee","Administrator"} else "Employee"
             with db() as con: con.execute("UPDATE users SET role=%s WHERE id=%s",(role,form.get("id")))
+            cache_invalidate("session:")
+            cache_invalidate("pinned:")
             self.audit("USER_ROLE_CHANGED", user["email"], f"Changed user {form.get('id')} role to {role}")
             return self.flash("/admin?tab=users","User role updated.")
         if path=="/admin/apps/toggle":
             with db() as con: con.execute("UPDATE applications SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=%s",(form.get("id"),))
+            cache_invalidate("apps:")
+            cache_invalidate("pinned:")
             self.audit("APP_STATUS_TOGGLED", user["email"], f"Toggled status for app {form.get('id')}", form.get("id"))
             return self.flash("/admin?tab=manage","Application status updated.")
         if path=="/admin/apps/delete":
             with db() as con: con.execute("DELETE FROM applications WHERE id=%s AND built_in=0",(form.get("id"),))
+            cache_invalidate("apps:")
+            cache_invalidate("pinned:")
             self.audit("APP_DELETED", user["email"], f"Deleted application {form.get('id')}", form.get("id"))
             return self.flash("/admin?tab=manage","Application removed.")
         if path=="/admin/announcements/create":
             try: progress=max(0,min(100,int(form.get("progress_percent","0") or 0)))
             except ValueError: progress=0
             with db() as con: con.execute("INSERT INTO announcements(title,app_name,version,description,status,created_at,release_date,highlights,progress_percent) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)",(form.get("title","")[:120],form.get("app_name","")[:100],form.get("version","v1.0")[:40],form.get("description","")[:600],form.get("status","Coming Soon"),now_iso(),form.get("release_date","")[:80],form.get("highlights","")[:500],progress))
+            cache_invalidate("announcements:")
             self.audit("RELEASE_PUBLISHED", user["email"], f"Published release: {form.get('title')}")
             return self.flash("/admin?tab=upcoming","Release information published.")
         if path=="/admin/announcements/delete":
             with db() as con: con.execute("DELETE FROM announcements WHERE id=%s",(form.get("id"),))
+            cache_invalidate("announcements:")
             self.audit("RELEASE_DELETED", user["email"], f"Deleted release {form.get('id')}")
             return self.flash("/admin?tab=upcoming","Release information removed.")
         return self.text("Not found",404)

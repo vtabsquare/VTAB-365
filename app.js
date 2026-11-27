@@ -86,3 +86,130 @@ document.addEventListener('click', function(e) {
         modal.classList.remove('open');
     }
 });
+
+// Seamless client-side SPA navigation (swaps <main class="content"> without full page reload)
+(function() {
+    let activeNavController = null;
+    const prefetched = new Map();
+
+    function activateTabFromUrl(urlObj) {
+        const wanted = urlObj.searchParams.get('tab') || urlObj.hash.slice(1);
+        const tab = wanted && document.querySelector(`.tab[data-tab="${wanted}"]`);
+        if (tab) tab.click();
+    }
+
+    function syncSidebarActive(targetUrl) {
+        const targetPath = targetUrl.pathname + targetUrl.search;
+        document.querySelectorAll('.sidebar .nav a[href]').forEach(a => {
+            const href = a.getAttribute('href');
+            if (!href || href.startsWith('javascript:')) return;
+            const linkUrl = new URL(href, location.origin);
+            const isMatch = (linkUrl.pathname + linkUrl.search) === targetPath;
+            a.classList.toggle('active', isMatch);
+        });
+    }
+
+    async function navigateTo(url, push = true) {
+        const mainEl = document.querySelector('main.content');
+        if (!mainEl) {
+            location.href = url;
+            return;
+        }
+        if (activeNavController) activeNavController.abort();
+        activeNavController = new AbortController();
+
+        mainEl.style.transition = 'opacity 0.12s ease';
+        mainEl.style.opacity = '0.6';
+
+        try {
+            const targetUrl = new URL(url, location.origin);
+            let htmlText = prefetched.get(targetUrl.href);
+            if (!htmlText) {
+                const res = await fetch(targetUrl.href, {
+                    credentials: 'same-origin',
+                    signal: activeNavController.signal
+                });
+                if (res.redirected && new URL(res.url).pathname === '/login') {
+                    location.href = res.url;
+                    return;
+                }
+                if (!res.ok && res.status !== 403 && res.status !== 404) {
+                    location.href = targetUrl.href;
+                    return;
+                }
+                htmlText = await res.text();
+            } else {
+                prefetched.delete(targetUrl.href);
+            }
+
+            const doc = new DOMParser().parseFromString(htmlText, 'text/html');
+            const nextMain = doc.querySelector('main.content');
+            if (!nextMain) {
+                location.href = targetUrl.href;
+                return;
+            }
+
+            mainEl.innerHTML = nextMain.innerHTML;
+            mainEl.style.opacity = '1';
+            document.title = doc.title || document.title;
+
+            const nextActions = doc.querySelector('.topbar .actions');
+            const curActions = document.querySelector('.topbar .actions');
+            if (nextActions && curActions) {
+                curActions.innerHTML = nextActions.innerHTML;
+            }
+
+            if (push) {
+                history.pushState({ url: targetUrl.href }, '', targetUrl.href);
+            }
+            syncSidebarActive(targetUrl);
+            activateTabFromUrl(targetUrl);
+            filterApps();
+
+            if (targetUrl.hash) {
+                const anchor = document.getElementById(targetUrl.hash.slice(1));
+                if (anchor) anchor.scrollIntoView({ behavior: 'smooth' });
+            } else {
+                window.scrollTo({ top: 0, behavior: 'instant' });
+            }
+            setTimeout(() => document.querySelectorAll('.flash').forEach(x => x.style.display = 'none'), 5000);
+        } catch (err) {
+            if (err.name !== 'AbortError') {
+                location.href = url;
+            }
+        }
+    }
+
+    document.addEventListener('click', function(e) {
+        if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        const link = e.target.closest('a[href]');
+        if (!link) return;
+        const href = link.getAttribute('href');
+        if (!href || href.startsWith('#') || href.startsWith('javascript:') || link.target === '_blank' || link.hasAttribute('download')) return;
+
+        const targetUrl = new URL(href, location.origin);
+        if (targetUrl.origin !== location.origin) return;
+        if (targetUrl.pathname.startsWith('/api/') || targetUrl.pathname === '/payroll/download' || targetUrl.pathname === '/logout') return;
+        if (!document.querySelector('main.content')) return;
+
+        e.preventDefault();
+        navigateTo(targetUrl.href, true);
+    });
+
+    document.addEventListener('pointerenter', function(e) {
+        const link = e.target.closest('.sidebar .nav a[href], .section-link[href], .page-home[href]');
+        if (!link) return;
+        const href = link.getAttribute('href');
+        if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+        const targetUrl = new URL(href, location.origin);
+        if (targetUrl.origin !== location.origin || prefetched.has(targetUrl.href)) return;
+        fetch(targetUrl.href, { credentials: 'same-origin' })
+            .then(r => (r.ok && !r.redirected) ? r.text() : null)
+            .then(text => { if (text) prefetched.set(targetUrl.href, text); })
+            .catch(() => {});
+    }, true);
+
+    window.addEventListener('popstate', function() {
+        navigateTo(location.href, false);
+    });
+})();
